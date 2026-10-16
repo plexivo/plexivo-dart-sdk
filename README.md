@@ -1,35 +1,149 @@
-# Plexivo Client for Flutter and Dart
+# Plexivo Postgres for Flutter and Dart
 
-Use the project API URL and publishable key from Plexivo. Never embed a database URL or server-only secret key in a Flutter application.
+`plexivo_client` is the client for **Plexivo Postgres**: your database, its Data API, authentication, realtime over WebSockets, GraphQL, functions and file storage.
 
-```dart
-final plexivo = PlexivoClient(dataUrl, publishableKey);
-await plexivo.signInWithPassword(email: email, password: password);
-final items = await plexivo.from('items').select();
+Use it **Supabase-style** (`from('notes').select().eq('pinned', true)`) or **GORM-style**: models, relations, `preload`, `whereHas`, `first`, `create`, `save`, hooks, scopes, soft deletes, transactions, association mode, and migrations and raw SQL on your server. Row-level security decides what every request can read and write.
+
+```yaml
+dependencies:
+  plexivo_client: ^0.2.0
 ```
 
-The SDK supports application-user signup/login/refresh, password changes, server-side sign-out, self-service account disablement, TOTP MFA, RLS-backed HTTPS CRUD, and realtime item changes. An expired access token is refreshed once and the original request is retried.
-
-Pass `initialSession` from encrypted device storage when constructing the client and write updated sessions from `authStateChanges` back to that encrypted store. The package intentionally does not place tokens in unencrypted preferences.
-
 ```dart
-final factor = await plexivo.mfa.enroll();
-// Render factor['uri'] as a QR code and collect a six-digit authenticator code.
-await plexivo.mfa.verify(code);
-await plexivo.signOut();
+import 'package:plexivo_client/plexivo_client.dart';
+
+final db = PlexivoClient(dataUrl, publishableKey);
+await db.signInWithPassword(email: email, password: password);
+
+final posts = await db.from('posts')
+    .where('likes', '>', 10)
+    .preload('author')
+    .order('created_at', 'desc')
+    .limit(20);
+print(posts.first['title']);
 ```
 
-Password recovery delivery, social OAuth, arbitrary schemas, Functions, WAL change capture and advanced Storage are not part of the verified staging surface.
+Your data URL and publishable key are on the database's **Connect** tab. The publishable key belongs in your app. The **secret key** is for servers only: it bypasses row-level security and runs raw SQL and migrations. Never ship it in a Flutter app.
 
-The minimal private Storage client is source-tested but disabled until a dedicated bucket-scoped MinIO identity and hostile staging acceptance exist:
+## Queries
+
+A query is immutable and chainable; `await` runs it. Results are a `PlexivoResult`: a list of rows that also carries `count`.
 
 ```dart
-final object = await plexivo.storage.upload(
-  'documents/readme.txt',
-  bytes,
-  contentType: 'text/plain',
+db.from('posts')
+  .where('likes', '>', 10)
+  .where({'published': true, 'deleted_at': null})          // null → IS NULL
+  .orWhere('title', 'ilike', '%postgres%')                  // AND binds tighter than OR
+  .where((PlexivoConditions q) => q.where('a', 1).orWhere('b', 'in', [2, 3]))
+  .whereNot('author_id', [1, 2])
+  .whereBetween('score', 1, 5)
+  .whereJson('meta', 'lang.code', 'hi')
+  .whereContains('tags', ['postgres'])
+  .whereSearch('body', 'fast cars', 'english')
+  .whereHas('comments', (PlexivoEmbed c) => c.where('approved', true))
+  .select('id, title as heading')
+  .order('likes', 'desc', 'last')
+  .page(2, 20);
+
+// Supabase-style
+final res = await db.from('notes')
+    .select('id, body, author:authors(name)', 'exact')
+    .eq('pinned', true)
+    .or('priority.gte.3,body.ilike.*urgent*')
+    .range(0, 19);
+print(res.count);
+final one = await db.from('notes').select().eq('id', 1).single(); // one.data
+```
+
+`is` and `in` are Dart keywords, so their PostgREST filters are `isFilter` and `inFilter`.
+
+Reading: `first(id?)`, `last()`, `take()`, `firstOrNull()`, `sole()`, `find([ids])`, `pluck('col')`, `count()`, `exists()`, `sum/avg/min/max`, `aggregate(...)`, `paginate(page:, perPage:)`, `findInBatches(500, (rows, i) {...})`, `await for (final row in q.each())`. `first()` throws `RecordNotFoundException` when nothing matches.
+
+## Writes
+
+```dart
+final post = await db.from('posts').create({'title': 'Hello'});
+await db.from('posts').createMany([{'title': 'a'}, {'title': 'b'}]);
+await db.from('products').upsert({'sku': 'A1', 'price': 11}, onConflict: 'sku', update: ['price']);
+await db.from('posts').save({'id': 7, 'title': 'New title'});
+await db.from('posts').where('id', 7).update({'title': 'T'});
+await db.from('posts').update({'title': 'T'}).eq('id', 7);      // Supabase order works too
+await db.from('products').where('sku', 'A1').decrement('stock', by: 2);
+await db.from('posts').where('id', 7).delete();
+await db.from('products').firstOrCreate({'sku': 'D4'}, {'name': 'Desk'});
+```
+
+An update or delete must say which rows it touches (`missing_where` otherwise); `allowGlobalUpdate()` is the opt-in.
+
+## Models, relations, transactions
+
+```dart
+final post = db.model('posts',
+  softDelete: 'deleted_at',
+  relations: {
+    'author': const PlexivoRelation.belongsTo('authors', foreignKey: 'author_id'),
+    'comments': const PlexivoRelation.hasMany('comments', foreignKey: 'post_id'),
+    'tags': const PlexivoRelation.manyToMany('tags', through: 'post_tags', foreignKey: 'post_id', otherKey: 'tag_id'),
+  },
+  hooks: PlexivoHooks(beforeCreate: (row) => {...row, 'slug': slugify(row['title'])}),
+  scopes: {'popular': (q) => q.where('likes', '>=', 10)},
 );
-final downloaded = await plexivo.storage.download(object['id'] as String);
+
+final rows = await post.query()
+    .scopes(['popular'])
+    .preload('author', (PlexivoEmbed a) => a.select('name'))
+    .preload('tags')
+    .withCount('comments')
+    .joins('comments', (PlexivoEmbed c) => c.where('approved', true));
+
+await post.association(row, 'tags').append([tagId]);
+
+// All or nothing, in one request; .ref() passes a result to the next step.
+await db.transaction((tx) {
+  final author = tx.from('authors').insert({'name': 'Asha'});
+  tx.from('posts').insert({'title': 'Hi', 'author_id': author.ref('id')});
+  tx.from('products').where('sku', 'B2').lockForUpdate().find();
+});
 ```
 
-This surface does not claim resumable upload, CDN delivery, transforms, malware scanning, retention policies or public buckets.
+## Realtime over WebSockets
+
+```dart
+final feed = db.channel('changes:orders', 'status=eq.open')..subscribe();
+feed.changes.listen((c) => print('${c.type} ${c.record}'));   // insert | update | delete
+
+final room = db.channel('room:lobby', null, {'name': 'Asha'})..subscribe();
+room.on('cursor').listen((p) => print(p));
+await room.ready();
+room.sendBroadcast('cursor', {'x': 10});
+room.presence.listen((p) => print(p.state));
+
+final stop = await db.graphqlSubscribe('subscription { notes { body } }', (r) => print(r['data']));
+```
+
+Each subscriber receives only the rows their row-level security lets them read. Channels reconnect on their own.
+
+## Auth
+
+`signUp`, `signInWithPassword`, `signInWithOtp`/`verifyOtp`, `signInAnonymously` + `linkEmail`, `getOAuthSignInUrl(provider: 'google' | 'github' | 'microsoft')` + `exchangeCodeForSession(code)`, password recovery, `mfa.enroll/verify`, `listSessions`/`revokeSession`, `signOut`, `authStateChanges`, and `orgs` (create, invite, acceptInvitation, members, setRole). Keep sessions in encrypted device storage: pass `initialSession`, and write updated sessions from `authStateChanges`.
+
+## Server: raw SQL and migrations (secret key)
+
+```dart
+final server = PlexivoClient(dataUrl, Platform.environment['PLEXIVO_SECRET_KEY']!);
+await server.raw(r'select * from orders where total > $1', [100]);
+await server.migrator.autoMigrate([postModel, commentModel]);   // creates what is missing, never drops
+await server.migrate([PlexivoMigration.sql('001_slug', 'alter table posts add column slug text', 'alter table posts drop column slug')]);
+```
+
+## Also
+
+`db.rpc('fn', {...})`, `db.graphql(query, persisted: true)`, `db.functions.invoke('name', body: {...})`, `db.storage.upload/download`, `db.getApi()`. Errors are `PlexivoException` with `code`, `message`, `hint`, `sqlstate`, `traceId` and, in a transaction, `operation`.
+
+## Development
+
+```sh
+dart test
+dart analyze
+API_URL=… PUBLISHABLE_KEY=… SECRET_KEY=… dart run tool/e2e_frontend.dart   # against a live project
+```

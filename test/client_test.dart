@@ -68,16 +68,13 @@ void main() {
         email: 'app@example.com',
         password: 'long-password',
       ),
-      throwsA(isA<PlexivoException>()
-          .having((error) => error.code, 'code', 'invalid_credentials')
-          .having((error) => error.traceId, 'traceId', 'trace-failure')),
+      throwsA(
+          isA<PlexivoException>().having((error) => error.code, 'code', 'invalid_credentials').having((error) => error.traceId, 'traceId', 'trace-failure')),
     );
     expect(client.lastTraceId, 'trace-failure');
   });
 
-  test(
-      'storage upload sends project credentials only to the capability mint endpoint',
-      () async {
+  test('storage upload sends project credentials only to the capability mint endpoint', () async {
     final requests = <http.Request>[];
     final transport = MockClient((request) async {
       requests.add(request);
@@ -98,8 +95,7 @@ void main() {
           jsonEncode({
             'data': {
               'object': {'id': 'object-one', 'status': 'pending'},
-              'signed_url':
-                  'https://api.example/client-storage/v1/demo/objects/object-one?token=signed'
+              'signed_url': 'https://api.example/client-storage/v1/demo/objects/object-one?token=signed'
             }
           }),
           201,
@@ -116,10 +112,7 @@ void main() {
             'data': {'id': 'object-one', 'status': 'ready'}
           }),
           200,
-          headers: {
-            'content-type': 'application/json',
-            'x-trace-id': 'trace-upload'
-          },
+          headers: {'content-type': 'application/json', 'x-trace-id': 'trace-upload'},
         );
       }
       throw StateError('unexpected request ${request.url}');
@@ -130,10 +123,8 @@ void main() {
       'plx_publishable_test',
       httpClient: transport,
     );
-    await client.signInWithPassword(
-        email: 'app@example.com', password: 'long-password');
-    final object = await client.storage
-        .upload('documents/readme.txt', [1, 2, 3], contentType: 'text/plain');
+    await client.signInWithPassword(email: 'app@example.com', password: 'long-password');
+    final object = await client.storage.upload('documents/readme.txt', [1, 2, 3], contentType: 'text/plain');
 
     expect(object['id'], 'object-one');
     expect(requests[1].headers['apikey'], 'plx_publishable_test');

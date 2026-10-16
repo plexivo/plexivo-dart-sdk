@@ -1,12 +1,13 @@
 name: plexivo_client
-description: Plexivo Client Data SDK for Flutter and Dart.
-version: 0.1.0
+description: Plexivo Postgres for Flutter and Dart — queries, models and relations, transactions, migrations, auth, realtime, GraphQL, functions and storage.
+version: 0.2.0
 homepage: https://plexivo.io/postgres/
 repository: https://github.com/plexivo/plexivo-dart-sdk
 issue_tracker: https://github.com/plexivo/plexivo-dart-sdk/issues
 environment:
   sdk: ">=3.4.0 <4.0.0"
 dependencies:
+  crypto: ^3.0.3
   http: ^1.2.2
   web_socket_channel: ^3.0.1
 dev_dependencies:
