@@ -1,0 +1,8 @@
+.dart_tool/
+.packages
+pubspec.lock
+build/
+coverage/
+.env
+.env.*
+.DS_Store
