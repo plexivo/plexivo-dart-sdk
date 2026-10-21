@@ -27,6 +27,40 @@ Your data URL and publishable key are on the database's **Connect** tab. The pub
 
 ## Queries
 
+### First working app
+
+Create a Plexivo Postgres database, enable its Data API on **Connect**, and copy the project URL and publishable key. For Flutter Web, allow the application's exact origin. The secret key belongs only on a trusted server, never in a Flutter build.
+
+Create a table in the SQL console, executing and confirming one statement at a time:
+
+```sql
+CREATE TABLE public.quickstart_notes (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id uuid NOT NULL DEFAULT auth.uid(),
+  body text NOT NULL
+);
+ALTER TABLE public.quickstart_notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_notes ON public.quickstart_notes TO authenticated
+  USING (owner_id = auth.uid()) WITH CHECK (owner_id = auth.uid());
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.quickstart_notes TO authenticated;
+GRANT USAGE ON SEQUENCE public.quickstart_notes_id_seq TO authenticated;
+```
+
+Enable `quickstart_notes` in the Data API table settings. This policy allows each signed-in user to access only their own notes.
+
+```dart
+final db = PlexivoClient(projectUrl, publishableKey);
+await db.signUp(email: email, password: password); // or signInWithPassword
+await db.from('quickstart_notes').insert({'body': 'Hello from Flutter'});
+final notes = await db.from('quickstart_notes').select('id, body');
+print(notes);
+```
+
+Follow your project's email-verification policy. For `429` responses, wait for `Retry-After` rather than retrying immediately. Data API, Auth, Realtime and Functions require the control plane; they do not have the same independence as direct database connections.
+
+### Query builder
+
 A query is immutable and chainable; `await` runs it. Results are a `PlexivoResult`: a list of rows that also carries `count`.
 
 ```dart
