@@ -31,7 +31,7 @@ Your data URL and publishable key are on the database's **Connect** tab. The pub
 
 Create a Plexivo Postgres database, enable its Data API on **Connect**, and copy the project URL and publishable key. For Flutter Web, allow the application's exact origin. The secret key belongs only on a trusted server, never in a Flutter build.
 
-Create a table in the SQL console, executing and confirming one statement at a time:
+Connect as the database owner using `plexivo db connect YOUR_DATABASE` and a PostgreSQL client such as `psql`, supplying credentials securely when prompted. Run this setup through that connection. The web SQL console intentionally does not accept policy or privilege-management statements:
 
 ```sql
 CREATE TABLE public.quickstart_notes (
@@ -47,7 +47,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.quickstart_notes TO authenticated
 GRANT USAGE ON SEQUENCE public.quickstart_notes_id_seq TO authenticated;
 ```
 
-Enable `quickstart_notes` in the Data API table settings. This policy allows each signed-in user to access only their own notes.
+Refresh the project's Data API schema and confirm `quickstart_notes` appears as exposed. A table needs row-level security and a policy to be exposed. This policy allows each signed-in user to access only their own notes. Close the administrative tunnel when setup is complete.
 
 ```dart
 final db = PlexivoClient(projectUrl, publishableKey);
