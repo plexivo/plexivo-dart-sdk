@@ -1,6 +1,7 @@
 linter:
   rules:
     - public_member_api_docs
+    - curly_braces_in_flow_control_structures
 
 formatter:
   page_width: 160

@@ -121,13 +121,14 @@ void main() {
           ]
         };
       }
-      if (body['op'] == 'aggregate')
+      if (body['op'] == 'aggregate') {
         return {
           'data': {
             'count': 4,
             'sum': {'likes': '70'}
           }
         };
+      }
       return {'data': rows};
     });
     expect(await h.db.from('posts').first(), {'id': 7, 'title': 'A'});

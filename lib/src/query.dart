@@ -77,18 +77,20 @@ Map<String, dynamic> condition(Object a, [Object? b = _absent, Object? c = _abse
   }
   final raw = b.toString().trim().toLowerCase();
   final value = c is List ? c.map(_plain).toList() : _plain(c);
-  if (_negated.containsKey(raw))
+  if (_negated.containsKey(raw)) {
     return {
       'not': {'column': a, 'op': _negated[raw], 'value': value}
     };
+  }
   final fts = RegExp(r'^(fts|plfts|phfts|wfts)\(([a-z_]+)\)$').firstMatch(raw);
   final op = fts != null ? raw : _operators[raw];
   if (op == null) throw ArgumentError('Unknown operator $b');
   if (op == 'eq' && value == null) return {'column': a, 'op': 'is', 'value': null};
-  if (op == 'neq' && value == null)
+  if (op == 'neq' && value == null) {
     return {
       'not': {'column': a, 'op': 'is', 'value': null}
     };
+  }
   return {'column': a, 'op': op, 'value': value};
 }
 

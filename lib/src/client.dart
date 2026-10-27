@@ -666,8 +666,9 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     } on FormatException {
       // A proxy's HTML error page, say: the failure still surfaces as a
       // PlexivoException with its status, not as a parser error.
-      if (ok)
+      if (ok) {
         throw PlexivoException(response.statusCode, 'invalid_response', message: 'The Data API returned a response that is not JSON', traceId: _lastTraceId);
+      }
       decoded = <String, dynamic>{};
     }
     final payload = decoded is Map ? Map<String, dynamic>.from(decoded) : <String, dynamic>{'data': decoded};
