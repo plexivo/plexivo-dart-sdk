@@ -37,5 +37,10 @@ CREATE POLICY post_as_yourself ON public.messages FOR INSERT TO authenticated
   WITH CHECK (author_id = auth.uid());
 GRANT SELECT, INSERT ON public.messages TO authenticated;
 
--- Then, in the console, open the database's Realtime tab (or Data API →
--- the table → Realtime) and switch Realtime on for todos and messages.
+-- Realtime for todos and messages: the same switch as the console's
+-- Realtime tab. Each subscriber receives a change only if their policies let
+-- them read the row.
+CREATE OR REPLACE TRIGGER plexivo_realtime AFTER INSERT OR UPDATE OR DELETE ON public.todos
+  FOR EACH ROW EXECUTE FUNCTION auth.realtime_notify('id');
+CREATE OR REPLACE TRIGGER plexivo_realtime AFTER INSERT OR UPDATE OR DELETE ON public.messages
+  FOR EACH ROW EXECUTE FUNCTION auth.realtime_notify('id');

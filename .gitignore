@@ -10,3 +10,4 @@ example/flutter_app/dart_defines.json
 example/flutter_app/.dart_tool/
 example/flutter_app/build/
 example/flutter_app/pubspec.lock
+tool/.docs/

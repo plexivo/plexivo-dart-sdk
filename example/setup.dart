@@ -34,6 +34,5 @@ Future<void> main() async {
   await server.sql.transaction(statements);
   print('Applied ${statements.length} statements.');
   print('todos exists: ${await server.migrator.hasTable('todos')}');
-  print('Next: switch Realtime on for todos and messages in the console (Realtime tab).');
   exit(0);
 }

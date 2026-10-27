@@ -2,8 +2,8 @@
 // with a live query, and a Plexivo Function — the whole backend, on
 // PostgreSQL, with row-level security deciding what each user can do.
 //
-// 1. Create the example tables (todos, messages) with example/schema.sql and
-//    switch Realtime on for both in the console.
+// 1. Create the example tables (todos, messages) with example/schema.sql,
+//    which also switches Realtime on for both.
 // 2. Run it with your project's URL and publishable key (Connect tab):
 //
 //      PLEXIVO_URL=https://… PLEXIVO_PUBLISHABLE_KEY=… dart run example/main.dart

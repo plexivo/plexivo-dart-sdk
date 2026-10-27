@@ -1,3 +1,43 @@
+## 0.4.0
+
+Joins, functions and realtime that look after themselves — every README
+example now runs against a live Plexivo Postgres before release.
+
+- **Order by a related column**: `order('profiles.username', 'desc')`, with a
+  foreign-key hint (`'profiles!posts_author_fk.username'`) or a model
+  relation name (`'author.username'`), as GORM's
+  `Joins("Author").Order("Author.name")`. `orderReferenced('comments', 'id')`
+  orders an embed's rows (Supabase's `referencedTable`).
+- **Subqueries**: `whereIn('author_id', db.from('profiles').select('id').eq('country', 'IN'))`,
+  `whereNotIn`, and `where(column, 'in', query)`; the subquery runs as the
+  caller, under its table's row-level security.
+- **Chainable `rpc`**: `db.rpc('search_posts', {'q': …})` is awaited as
+  before, and now also takes `select` (with related rows), filters, `order`,
+  `limit`, `range`, a count, `single()` and `maybeSingle()` for functions
+  that return rows.
+- **Preload by path**: `preload('comments.author')` and `joins('comments.author')`,
+  as GORM's `Preload("Comments.Author")`, merging into an embed already in
+  the query.
+- **User metadata**: `signUp(…, data: {...})`, `updateUser(data: {...})`
+  (merged; null removes a key) and `currentUser`, with `user_metadata`.
+- **Realtime that stays joined**: after a dropped connection, a server
+  `phx_close` / `phx_error`, or an expired access token, a channel refreshes
+  the session if needed and rejoins by itself with backoff, and renews the
+  token before it expires. A refused join is final and reported once. New
+  `status`, `statusChanges`, `isJoined` and `reconnect()`; live GraphQL
+  queries resubscribe after a rejoin.
+- **Secret key refused on the web**: a web build throws
+  `secret_key_in_browser` when given a `plx_secret_` key.
+- **Fixes**: `DateTime` values in inserts and updates are sent as UTC ISO
+  8601 (they failed to encode); `pluck()`, `exists()`, `count()` and other
+  aggregates keep inner joins (`joins(…)`) as filters.
+- **Docs and tests**: a new README (quick start in Flutter, auth, filters,
+  joins, aggregates, upserts, transactions, raw SQL on a server, realtime,
+  security recipes, types, errors, coming from Firebase and Supabase);
+  `tool/docs.dart` runs every README block, the Flutter quick start as a
+  widget test and a web build; `tool/e2e.dart` is the end-to-end suite,
+  direct and through the connection pooler; `example/blog.sql`.
+
 ## 0.3.0
 
 Plexivo Postgres as a Backend-as-a-Service, documented end to end.
