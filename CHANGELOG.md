@@ -1,3 +1,24 @@
+## 0.3.0
+
+Plexivo Postgres as a Backend-as-a-Service, documented end to end.
+
+- **Documentation**: a new README (quick start in five minutes, auth, data,
+  realtime, GraphQL and live queries, Plexivo Functions, files, errors and
+  null safety, security, coming from Firebase) and dartdoc on every public
+  member, with examples, for the pub.dev API reference.
+- **Examples**: `example/main.dart` (auth, todo CRUD, realtime, GraphQL with
+  a live query, a function call), a Flutter app (`example/flutter_app`:
+  sign-in, live todos, realtime chat), `example/schema.sql`,
+  `example/setup.dart` and the `hello` function. Analyzed clean, and
+  `example/main.dart` ran against a live Plexivo Postgres before release.
+- **Functions**: `functions.invoke(name, path:, query:)` calls a sub-route
+  with a query string, as the JavaScript client does.
+- **Fixes**: a non-JSON error body (a proxy's error page) fails as a
+  `PlexivoException` with its status; `signOut()` while signed out
+  completes; a refused realtime join completes `ready()` with a
+  `PlexivoException` and reaches `graphqlSubscribe`'s `onResult` instead of
+  waiting forever.
+
 ## 0.2.0
 
 Everything Plexivo Postgres offers, from Flutter and Dart.
