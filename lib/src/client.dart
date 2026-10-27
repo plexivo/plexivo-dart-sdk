@@ -333,9 +333,18 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     if (body != null) request.body = jsonEncode(body);
     final response = await http.Response.fromStream(await _http.send(request));
     _lastTraceId = response.headers['x-trace-id'];
-    final decoded = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+    final ok = response.statusCode >= 200 && response.statusCode < 300;
+    Object? decoded;
+    try {
+      decoded = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+    } on FormatException {
+      // A proxy's HTML error page, say: the failure still surfaces as a
+      // PlexivoException with its status, not as a parser error.
+      if (ok) throw PlexivoException(response.statusCode, 'invalid_response', message: 'The Data API returned a response that is not JSON', traceId: _lastTraceId);
+      decoded = <String, dynamic>{};
+    }
     final payload = decoded is Map ? Map<String, dynamic>.from(decoded) : <String, dynamic>{'data': decoded};
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    if (!ok) {
       if (sendToken && allowRefresh && response.statusCode == 401 && payload['error']?['code'] == 'token_expired' && _session?['refresh_token'] != null) {
         await _refreshExpiredSession();
         return _request(path, method: method, body: body, auth: auth, allowRefresh: false);
@@ -517,9 +526,18 @@ class PlexivoFunctions {
   final PlexivoClient _c;
 
   Future<({dynamic data, int status, Map<String, String> headers})> invoke(String name,
-      {Object? body, String method = 'POST', Map<String, String> headers = const {}}) async {
-    final request = http.Request(method, Uri.parse('${_c._base()}/functions/v1/${Uri.encodeComponent(name)}'))
-      ..headers.addAll({'apikey': _c.publishableKey, ...headers});
+      {Object? body, String method = 'POST', Map<String, String> headers = const {}, String path = '', Map<String, Object?> query = const {}}) async {
+    if (name.isEmpty || name == '.' || name == '..') throw ArgumentError.value(name, 'name', 'Invalid function name');
+    final segments = path.split('/').where((s) => s.isNotEmpty).toList();
+    if (segments.any((s) => s == '.' || s == '..')) throw ArgumentError.value(path, 'path', 'Function path must not contain dot segments');
+    final suffix = segments.isEmpty ? '' : '/${segments.map(Uri.encodeComponent).join('/')}';
+    var uri = Uri.parse('${_c._base()}/functions/v1/${Uri.encodeComponent(name)}$suffix');
+    final params = {
+      for (final e in query.entries)
+        if (e.value != null) e.key: e.value.toString()
+    };
+    if (params.isNotEmpty) uri = uri.replace(queryParameters: params);
+    final request = http.Request(method, uri)..headers.addAll({'apikey': _c.publishableKey, ...headers});
     final token = _c._session?['access_token'];
     if (token != null) request.headers['authorization'] = 'Bearer $token';
     if (body != null) {

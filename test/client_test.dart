@@ -131,4 +131,35 @@ void main() {
     expect(requests[1].headers['authorization'], 'Bearer access');
     expect(client.lastTraceId, 'trace-upload');
   });
+
+  test('a non-JSON error page still fails as a PlexivoException with its status', () async {
+    final client = PlexivoClient('https://api.example/client/v1/demo', 'plx_publishable_test',
+        httpClient: MockClient((request) async => http.Response('<html>Bad gateway</html>', 502,
+            headers: {'content-type': 'text/html', 'x-trace-id': 'trace-502'})));
+    await expectLater(
+        client.from('notes').select(),
+        throwsA(isA<PlexivoException>()
+            .having((e) => e.statusCode, 'statusCode', 502)
+            .having((e) => e.traceId, 'traceId', 'trace-502')));
+  });
+
+  test('functions.invoke encodes a sub-path and query on the project origin', () async {
+    final seen = <http.Request>[];
+    final client = PlexivoClient('https://api.example/client/v1/project', 'plx_publishable_test',
+        httpClient: MockClient((request) async {
+      seen.add(request);
+      return http.Response('{"ok":true}', 200, headers: {'content-type': 'application/json'});
+    }));
+    final result = await client.functions.invoke('echo',
+        path: '/some folder/part?x=1', query: {'q': 'a & b', 'n': 2, 'flag': false, 'absent': null}, body: {'hello': 'world'});
+    expect(result.data, {'ok': true});
+    final url = seen.single.url;
+    expect(url.origin, 'https://api.example');
+    expect(url.path, '/client/v1/project/functions/v1/echo/some%20folder/part%3Fx%3D1');
+    expect(url.queryParameters, {'q': 'a & b', 'n': '2', 'flag': 'false'});
+    expect(seen.single.body, '{"hello":"world"}');
+    expect(() => client.functions.invoke('echo', path: '../other'), throwsArgumentError);
+    expect(() => client.functions.invoke('..'), throwsArgumentError);
+    expect(seen, hasLength(1));
+  });
 }
