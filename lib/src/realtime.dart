@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'errors.dart';
+
 /// A row change: `insert`, `update` or `delete`, as this subscriber may read it.
 ///
 /// The subscriber's row-level security decides which changes they receive.
@@ -169,8 +171,9 @@ class PlexivoRealtimeChannel {
 
   /// Completes once the channel has joined, at once if it already has.
   ///
-  /// If the server refuses the join, it does not complete: [errors] reports the
-  /// reason.
+  /// If the server refuses the join, it completes with a [PlexivoException]
+  /// whose `code` is the reason (`table_not_exposed`, `sign_in_required`), and
+  /// [errors] reports the reason too.
   Future<void> ready() {
     if (_joined) return Future.value();
     final c = Completer<void>();
@@ -214,7 +217,13 @@ class PlexivoRealtimeChannel {
             }
             _joinWaiters.clear();
           } else {
-            _errors.add(((reply['response'] as Map?)?['reason'] ?? 'join_refused').toString());
+            final reason = ((reply['response'] as Map?)?['reason'] ?? 'join_refused').toString();
+            final error = PlexivoException(403, reason, message: 'Realtime refused to join $_topic: $reason');
+            for (final w in _joinWaiters) {
+              if (!w.isCompleted) w.completeError(error);
+            }
+            _joinWaiters.clear();
+            _errors.add(reason);
           }
         });
       _heartbeat?.cancel();

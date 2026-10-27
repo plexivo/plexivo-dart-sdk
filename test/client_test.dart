@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -134,24 +135,20 @@ void main() {
 
   test('a non-JSON error page still fails as a PlexivoException with its status', () async {
     final client = PlexivoClient('https://api.example/client/v1/demo', 'plx_publishable_test',
-        httpClient: MockClient((request) async => http.Response('<html>Bad gateway</html>', 502,
-            headers: {'content-type': 'text/html', 'x-trace-id': 'trace-502'})));
-    await expectLater(
-        client.from('notes').select(),
-        throwsA(isA<PlexivoException>()
-            .having((e) => e.statusCode, 'statusCode', 502)
-            .having((e) => e.traceId, 'traceId', 'trace-502')));
+        httpClient:
+            MockClient((request) async => http.Response('<html>Bad gateway</html>', 502, headers: {'content-type': 'text/html', 'x-trace-id': 'trace-502'})));
+    await expectLater(client.from('notes').select(),
+        throwsA(isA<PlexivoException>().having((e) => e.statusCode, 'statusCode', 502).having((e) => e.traceId, 'traceId', 'trace-502')));
   });
 
   test('functions.invoke encodes a sub-path and query on the project origin', () async {
     final seen = <http.Request>[];
-    final client = PlexivoClient('https://api.example/client/v1/project', 'plx_publishable_test',
-        httpClient: MockClient((request) async {
+    final client = PlexivoClient('https://api.example/client/v1/project', 'plx_publishable_test', httpClient: MockClient((request) async {
       seen.add(request);
       return http.Response('{"ok":true}', 200, headers: {'content-type': 'application/json'});
     }));
-    final result = await client.functions.invoke('echo',
-        path: '/some folder/part?x=1', query: {'q': 'a & b', 'n': 2, 'flag': false, 'absent': null}, body: {'hello': 'world'});
+    final result = await client.functions
+        .invoke('echo', path: '/some folder/part?x=1', query: {'q': 'a & b', 'n': 2, 'flag': false, 'absent': null}, body: {'hello': 'world'});
     expect(result.data, {'ok': true});
     final url = seen.single.url;
     expect(url.origin, 'https://api.example');
@@ -161,5 +158,58 @@ void main() {
     expect(() => client.functions.invoke('echo', path: '../other'), throwsArgumentError);
     expect(() => client.functions.invoke('..'), throwsArgumentError);
     expect(seen, hasLength(1));
+  });
+
+  test('signOut while signed out completes and still reports SIGNED_OUT', () async {
+    var calls = 0;
+    final client = PlexivoClient('https://api.example/client/v1/demo', 'plx_publishable_test', httpClient: MockClient((request) async {
+      calls++;
+      return http.Response('{}', 200);
+    }));
+    final events = <String>[];
+    final sub = client.authStateChanges.listen((s) => events.add(s.event));
+    await client.signOut();
+    await Future<void>.delayed(Duration.zero);
+    expect(events, ['SIGNED_OUT']);
+    expect(calls, 0);
+    await sub.cancel();
+  });
+
+  test('a refused realtime join fails ready() and reaches graphqlSubscribe', () async {
+    // A local WebSocket server that refuses every join, as the Brain does for a hidden table.
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.listen((frame) {
+        final f = jsonDecode(frame as String) as List;
+        if (f[3] == 'phx_join') {
+          socket.add(jsonEncode([
+            null,
+            f[1],
+            f[2],
+            'phx_reply',
+            {
+              'status': 'error',
+              'response': {'reason': 'table_not_exposed'}
+            }
+          ]));
+        }
+      });
+    });
+    addTearDown(() => server.close(force: true));
+    final client = PlexivoClient('http://127.0.0.1:${server.port}/client/v1/demo', 'plx_publishable_test');
+
+    final channel = client.channel('changes:secret')..subscribe();
+    final errors = <String>[];
+    channel.errors.listen(errors.add);
+    await expectLater(channel.ready(), throwsA(isA<PlexivoException>().having((e) => e.code, 'code', 'table_not_exposed')));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(errors, ['table_not_exposed']);
+    await channel.unsubscribe();
+
+    final results = <Map<String, dynamic>>[];
+    final stop = await client.graphqlSubscribe('subscription { todos { id } }', results.add).timeout(const Duration(seconds: 5));
+    expect(((results.single['errors'] as List).single as Map)['extensions'], {'code': 'table_not_exposed'});
+    await stop();
   });
 }

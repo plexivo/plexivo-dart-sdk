@@ -313,15 +313,28 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// await stop();
   /// ```
   ///
-  /// If the server refuses the subscription, [onResult] gets a map with
-  /// `errors`. The returned Future completes once the channel has joined.
+  /// If the server refuses the subscription (or the join), [onResult] gets a
+  /// map with `errors`. The returned Future completes once the channel has joined or was refused.
   Future<Future<void> Function()> graphqlSubscribe(String query, void Function(Map<String, dynamic> result) onResult,
       {Map<String, dynamic> variables = const {}}) async {
     final id = 'q${Random().nextInt(1 << 31).toRadixString(36)}';
     final ch = channel('graphql');
     ch.onGraphql(id, onResult);
     ch.subscribe();
-    await ch.ready();
+    try {
+      await ch.ready();
+    } on PlexivoException catch (e) {
+      onResult({
+        'errors': [
+          {
+            'message': e.message,
+            'extensions': {'code': e.code}
+          }
+        ]
+      });
+      await ch.unsubscribe();
+      return () async {};
+    }
     final reply = await ch.push('subscribe', {'id': id, 'query': query, 'variables': variables});
     if (reply['status'] != 'ok') {
       final response = reply['response'] as Map?;
@@ -576,13 +589,18 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// Signs out this device, or every device with [allSessions].
   ///
   /// The local session is cleared and `SIGNED_OUT` emitted even if the request
-  /// fails. Throws a [StateError] when no one is signed in.
+  /// fails. Signing out while already signed out completes at once and still reports `SIGNED_OUT`.
   ///
   /// ```dart
   /// await db.signOut();                  // this device
   /// await db.signOut(allSessions: true); // every device
   /// ```
   Future<void> signOut({bool allSessions = false}) async {
+    // Already signed out: nothing to revoke on the server.
+    if (_session?['access_token'] == null) {
+      _setSession(null, 'SIGNED_OUT');
+      return;
+    }
     try {
       await _request('/auth/logout',
           method: 'POST', body: allSessions ? {} : {'refresh_token': _session?['refresh_token']}, auth: _Auth.required, allowRefresh: false);
@@ -648,7 +666,8 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     } on FormatException {
       // A proxy's HTML error page, say: the failure still surfaces as a
       // PlexivoException with its status, not as a parser error.
-      if (ok) throw PlexivoException(response.statusCode, 'invalid_response', message: 'The Data API returned a response that is not JSON', traceId: _lastTraceId);
+      if (ok)
+        throw PlexivoException(response.statusCode, 'invalid_response', message: 'The Data API returned a response that is not JSON', traceId: _lastTraceId);
       decoded = <String, dynamic>{};
     }
     final payload = decoded is Map ? Map<String, dynamic>.from(decoded) : <String, dynamic>{'data': decoded};

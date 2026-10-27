@@ -20,22 +20,12 @@ Future<void> main() async {
   final visitor = PlexivoClient(url, key, httpClient: visitorHttp);
   final user = PlexivoClient(url, key, httpClient: userHttp);
   try {
-    final reply =
-        await visitor.functions.invoke('echo', body: {'from': 'dart'});
-    expect(
-        reply.status == 200 &&
-            reply.data['role'] == 'anon' &&
-            (reply.data['body'] as String).contains('"from":"dart"'),
-        'visitor function');
-    final session = await user.signUp(
-        email: 'dart-fn-${DateTime.now().microsecondsSinceEpoch}@example.test',
-        password: 'a long test-only password');
+    final reply = await visitor.functions.invoke('echo', body: {'from': 'dart'});
+    expect(reply.status == 200 && reply.data['role'] == 'anon' && (reply.data['body'] as String).contains('"from":"dart"'), 'visitor function');
+    final session = await user.signUp(email: 'dart-fn-${DateTime.now().microsecondsSinceEpoch}@example.test', password: 'a long test-only password');
     final signedIn = await user.functions.invoke('echo', method: 'GET');
     expect(
-        signedIn.data['role'] == 'authenticated' &&
-            signedIn.data['user'] == session['user']['id'] &&
-            signedIn.data['method'] == 'GET',
-        'signed-in function');
+        signedIn.data['role'] == 'authenticated' && signedIn.data['user'] == session['user']['id'] && signedIn.data['method'] == 'GET', 'signed-in function');
     var rejected = false;
     try {
       await visitor.functions.invoke('missing');
