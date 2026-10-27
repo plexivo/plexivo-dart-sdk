@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 
 import 'errors.dart';
 import 'model.dart';
+import 'platform.dart';
 import 'query.dart';
 import 'realtime.dart';
 import 'sql.dart';
@@ -42,6 +43,10 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   ///   signed in across app restarts. Null starts signed out.
   /// - [realtimeClientId] is sent as `client_id` when a realtime channel joins.
   ///
+  /// In a web app (Flutter web or Dart compiled to JavaScript or WebAssembly),
+  /// passing a secret key (`plx_secret_…`) throws a [PlexivoException] with
+  /// code `secret_key_in_browser`: anyone can read a key from a web page.
+  ///
   /// ```dart
   /// final saved = await loadSessionFromSecureStorage(); // may be null
   /// final db = PlexivoClient(dataUrl, publishableKey, initialSession: saved);
@@ -49,7 +54,9 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// ```
   PlexivoClient(this.apiUrl, this.publishableKey, {http.Client? httpClient, Map<String, dynamic>? initialSession, this.realtimeClientId})
       : _http = httpClient ?? http.Client(),
-        _session = initialSession;
+        _session = initialSession {
+    checkKeyForPlatform(publishableKey);
+  }
 
   /// The database's Data API URL, from the **Connect** tab.
   @override
@@ -79,6 +86,16 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// It includes `access_token` and `refresh_token`. Save it in encrypted device
   /// storage and pass it back as `initialSession` to stay signed in.
   Map<String, dynamic>? get session => _session;
+
+  /// The signed-in user from the [session], or null when signed out.
+  ///
+  /// It includes `id`, `email`, `is_anonymous` and `user_metadata`, the
+  /// profile data set at [signUp] or with [updateUser]. Call [getUser] for a
+  /// fresh copy from the server.
+  Map<String, dynamic>? get currentUser {
+    final user = _session?['user'];
+    return user is Map ? Map<String, dynamic>.from(user) : null;
+  }
 
   /// The trace id of the most recent response, or null if it had none.
   ///
@@ -251,20 +268,29 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     return results;
   }
 
-  /// Calls the database function [function] with named [args] and returns its result.
+  /// Calls the database function [function] with named [args].
   ///
   /// Only functions exposed with `COMMENT ON FUNCTION … IS '@expose'` can be
-  /// called (`POST /rest/v1/rpc/<function>`). They run as the signed-in user, or
-  /// anonymously when signed out. The result is the function's return value
-  /// decoded from JSON: a number, string, map, list, or null.
+  /// called. They run as the signed-in user, or anonymously when signed out.
+  /// Awaited as it is, the result is the function's return value decoded from
+  /// JSON: a number, string, map, list, or null.
+  ///
+  /// For a function returning rows (`SETOF` a table, or `TABLE (…)`), chain
+  /// `select`, filters, `order`, `limit`, `range`, `single` and a count, as on
+  /// a query; see [PlexivoRpc].
   ///
   /// ```dart
   /// final total = await db.rpc('cart_total', {'cart_id': 7});
+  ///
+  /// final hits = await db.rpc('search_posts', {'q': 'postgres'})
+  ///     .select('id, title', 'exact')
+  ///     .order('likes', 'desc')
+  ///     .limit(10);
   /// ```
   ///
   /// Throws a [PlexivoException] when the call fails.
-  Future<dynamic> rpc(String function, [Map<String, dynamic> args = const {}]) async =>
-      (await _request('/rest/v1/rpc/${Uri.encodeComponent(function)}', method: 'POST', body: args, auth: _Auth.optional))['data'];
+  PlexivoRpc rpc(String function, [Map<String, dynamic> args = const {}]) => PlexivoRpc(function, args, PlexivoQuery(ModelContext(this, function)),
+      () async => (await _request('/rest/v1/rpc/${Uri.encodeComponent(function)}', method: 'POST', body: args, auth: _Auth.optional))['data']);
 
   /// Runs a GraphQL query or mutation and returns `{data, errors}`.
   ///
@@ -315,6 +341,7 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   ///
   /// If the server refuses the subscription (or the join), [onResult] gets a
   /// map with `errors`. The returned Future completes once the channel has joined or was refused.
+  /// After a reconnect the live query is subscribed again by itself.
   Future<Future<void> Function()> graphqlSubscribe(String query, void Function(Map<String, dynamic> result) onResult,
       {Map<String, dynamic> variables = const {}}) async {
     final id = 'q${Random().nextInt(1 << 31).toRadixString(36)}';
@@ -335,17 +362,29 @@ class PlexivoClient implements DataLayer, RealtimeHost {
       await ch.unsubscribe();
       return () async {};
     }
-    final reply = await ch.push('subscribe', {'id': id, 'query': query, 'variables': variables});
-    if (reply['status'] != 'ok') {
-      final response = reply['response'] as Map?;
-      onResult({
-        'errors': response?['errors'] ??
-            [
-              {'message': response?['reason'] ?? 'subscribe failed'}
-            ]
-      });
+    Future<void> start() async {
+      final Map<String, dynamic> reply;
+      try {
+        reply = await ch.push('subscribe', {'id': id, 'query': query, 'variables': variables});
+      } catch (_) {
+        return; // The connection dropped meanwhile: the rejoin subscribes again.
+      }
+      if (reply['status'] != 'ok') {
+        final response = reply['response'] as Map?;
+        onResult({
+          'errors': response?['errors'] ??
+              [
+                {'message': response?['reason'] ?? 'subscribe failed'}
+              ]
+        });
+      }
     }
+
+    await start();
+    // After a reconnect the server has forgotten the subscription: subscribe again.
+    final rejoins = ch.statusChanges.where((s) => s == PlexivoChannelStatus.joined).listen((_) => start());
     return () async {
+      await rejoins.cancel();
       try {
         await ch.push('unsubscribe', {'id': id});
       } catch (_) {}
@@ -377,8 +416,11 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// await room.ready();
   /// room.sendBroadcast('wave', {'from': 'Asha'});
   /// ```
-  PlexivoRealtimeChannel channel([String topic = 'items', String? filter, Map<String, dynamic>? presence]) =>
-      PlexivoRealtimeChannel(this, topic, filter: filter, presenceMeta: presence, clientId: realtimeClientId);
+  PlexivoRealtimeChannel channel([String topic = 'items', String? filter, Map<String, dynamic>? presence]) => PlexivoRealtimeChannel(this, topic,
+      filter: filter,
+      presenceMeta: presence,
+      clientId: realtimeClientId,
+      refreshSession: () async => _session?['refresh_token'] == null ? null : _refreshExpiredSession());
 
   // ── server: raw SQL and migrations (secret key) ────────────────────────
 
@@ -427,15 +469,39 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   /// `SIGNED_UP` on [authStateChanges] and returns the session. Follow your
   /// project's email-verification policy.
   ///
+  /// [data] is the user's profile, such as a display name or avatar URL (a
+  /// JSON object of at most 4 KB). It is kept as the user's `user_metadata`,
+  /// on [currentUser] and in every session; change it with [updateUser].
+  ///
   /// ```dart
-  /// await db.signUp(email: 'asha@example.com', password: 'a long password');
-  /// print(db.session?['user']);
+  /// await db.signUp(email: 'asha@example.com', password: 'a long password', data: {'name': 'Asha'});
+  /// print(db.currentUser?['user_metadata']); // {name: Asha}
   /// ```
   ///
   /// Throws a [PlexivoException] if the account cannot be created, for example
   /// when the email is taken.
-  Future<Map<String, dynamic>> signUp({required String email, required String password}) =>
-      _authenticate('/auth/signup', {'email': email, 'password': password});
+  Future<Map<String, dynamic>> signUp({required String email, required String password, Map<String, dynamic>? data}) =>
+      _authenticate('/auth/signup', {'email': email, 'password': password, if (data != null) 'data': data});
+
+  /// Changes the signed-in user's profile data (`user_metadata`) and returns the user.
+  ///
+  /// [data] is merged into the existing metadata; a key set to null is
+  /// removed. Updates [currentUser] and emits `USER_UPDATED`.
+  ///
+  /// ```dart
+  /// final user = await db.updateUser(data: {'theme': 'dark', 'nickname': null});
+  /// print(user['user_metadata']);
+  /// ```
+  ///
+  /// Throws a [StateError] when no one is signed in, and a [PlexivoException]
+  /// when the server refuses the change.
+  Future<Map<String, dynamic>> updateUser({required Map<String, dynamic> data}) async {
+    final r = await _request('/auth/user', method: 'PATCH', body: {'data': data}, auth: _Auth.required);
+    final user = Map<String, dynamic>.from((r['user'] ?? r) as Map);
+    final current = _session;
+    if (current != null) _setSession({...current, 'user': user}, 'USER_UPDATED');
+    return user;
+  }
 
   /// Signs in with [email] and [password], and returns the new session.
   ///
@@ -656,7 +722,7 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     final sendToken = auth != _Auth.none && token != null;
     if (sendToken) headers['authorization'] = 'Bearer $token';
     final request = http.Request(method, Uri.parse('${_base()}$path'))..headers.addAll(headers);
-    if (body != null) request.body = jsonEncode(body);
+    if (body != null) request.body = jsonEncode(body, toEncodable: _encodable);
     final response = await http.Response.fromStream(await _http.send(request));
     _lastTraceId = response.headers['x-trace-id'];
     final ok = response.statusCode >= 200 && response.statusCode < 300;
@@ -714,6 +780,12 @@ class PlexivoClient implements DataLayer, RealtimeHost {
 }
 
 enum _Auth { none, optional, required }
+
+/// Encodes values JSON has no form for: a `DateTime` as UTC ISO 8601.
+Object? _encodable(Object? value) {
+  if (value is DateTime) return value.toUtc().toIso8601String();
+  throw JsonUnsupportedObjectError(value);
+}
 
 /// One recorded operation of a transaction: a Future for its result, and refs for later operations.
 class _TxHandle<T> implements Future<T>, RefSource {

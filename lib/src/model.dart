@@ -371,6 +371,15 @@ class ModelContext implements TableContext {
   @override
   TableContext child(String t) => ModelContext(_layer, t, _layer.modelOf(t));
 
+  @override
+  ({String table, String? hint}) orderRelation(String name) {
+    final r = _relation(name);
+    if (r.kind == 'hasMany' || r.kind == 'manyToMany') {
+      throw ArgumentError('order by $name: only a belongs-to or has-one relation has one row to order by');
+    }
+    return (table: r.table, hint: r.constraint);
+  }
+
   PlexivoRelation _relation(String name) {
     final r = _model?.relations[name];
     if (r != null) return r;
@@ -544,7 +553,17 @@ Map<String, dynamic> _shapeRow(Map<String, dynamic> row, List<Map<String, dynami
     final m2m = e['__m2m'] as Map?;
     if (m2m != null) {
       final key = '__m2m_${m2m['as']}';
-      var list = ((out[key] as List?) ?? const []).map((link) => (link as Map)['__target']).whereType<Map>().map((t) => Map<String, dynamic>.from(t)).toList();
+      final target = ((e['select'] as List?) ?? const []).whereType<Map>().firstOrNull;
+      final targetNested = ((target?['select'] as List?) ?? const [])
+          .whereType<Map>()
+          .where((x) => x['embed'] != null || x['aggregate'] != null)
+          .map((x) => Map<String, dynamic>.from(x))
+          .toList();
+      var list = ((out[key] as List?) ?? const [])
+          .map((link) => (link as Map)['__target'])
+          .whereType<Map>()
+          .map((t) => targetNested.isEmpty ? Map<String, dynamic>.from(t) : _shapeRow(Map<String, dynamic>.from(t), targetNested))
+          .toList();
       final order = (m2m['order'] as List?)?.cast<Map>() ?? const [];
       if (order.isNotEmpty) list = _sortRows(list, order);
       out.remove(key);

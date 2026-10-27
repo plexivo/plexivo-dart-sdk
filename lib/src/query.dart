@@ -71,11 +71,18 @@ Map<String, dynamic> condition(Object a, [Object? b = _absent, Object? c = _abse
   if (a is! String || a.isEmpty) throw ArgumentError('where() takes a column, a map or a function');
   if (identical(c, _absent)) {
     final value = identical(b, _absent) ? null : b;
+    if (value is PlexivoQuery) return {'column': a, 'op': 'in', 'query': value.toSubquery()};
     if (value is List) return {'column': a, 'op': 'in', 'value': value.map(_plain).toList()};
     if (value == null) return {'column': a, 'op': 'is', 'value': null};
     return {'column': a, 'op': 'eq', 'value': _plain(value)};
   }
   final raw = b.toString().trim().toLowerCase();
+  if (c is PlexivoQuery) {
+    final sub = {'column': a, 'op': 'in', 'query': c.toSubquery()};
+    if (raw == 'in' || raw == '=' || raw == '==' || raw == 'eq') return sub;
+    if (raw == 'not in' || raw == '!=' || raw == '<>' || raw == 'neq') return {'not': sub};
+    throw ArgumentError('A subquery works with in and not in, not $b');
+  }
   final value = c is List ? c.map(_plain).toList() : _plain(c);
   if (_negated.containsKey(raw)) {
     return {
@@ -273,8 +280,11 @@ class PlexivoConditions {
   /// Adds a negated filter, `NOT (…)`, joined with AND.
   PlexivoConditions whereNot(Object column, [Object? op = _absent, Object? value = _absent]) => _term('and', {'not': condition(column, op, value, _ctx)});
 
-  /// Keeps rows whose [column] is one of [values].
-  PlexivoConditions whereIn(String column, List<Object?> values) => where(column, 'in', values);
+  /// Keeps rows whose [column] is one of [values]: a list, or a one-column subquery; see [PlexivoQuery.whereIn].
+  PlexivoConditions whereIn(String column, Object values) => where(column, 'in', values);
+
+  /// Keeps rows whose [column] is none of [values]: a list, or a one-column subquery.
+  PlexivoConditions whereNotIn(String column, Object values) => where(column, 'not in', values);
 
   /// Keeps rows where [column] is null.
   PlexivoConditions whereNull(String column) => where(column, 'is', null);
@@ -345,6 +355,12 @@ abstract class TableContext {
 
   /// The context of another [table], with its model.
   TableContext child(String table);
+
+  /// The table and foreign-key hint that [relation] names, for ordering by a related column.
+  ///
+  /// [relation] is a relation of the table's model or a table name, with an
+  /// optional `!constraint` hint.
+  ({String table, String? hint}) orderRelation(String relation);
 }
 
 Map<String, dynamic> _orderTerm(Object column, [Object? dir, bool? ascending, String? nulls]) {
@@ -362,11 +378,25 @@ Map<String, dynamic> _orderTerm(Object column, [Object? dir, bool? ascending, St
   }
   if (d != 'asc' && d != 'desc') throw ArgumentError('order direction is asc or desc, not $dir');
   final agg = RegExp(r'^(count|sum|avg|min|max)\((\*|[A-Za-z_]\w*)?\)$', caseSensitive: false).firstMatch(col);
+  // `author.username` or `profiles!posts_author_id_fkey.username`: a column of a to-one related row.
+  final related = RegExp(r'^([A-Za-z_]\w*)(?:!([A-Za-z_]\w*))?\.([A-Za-z_]\w*)$').firstMatch(col);
   final term = agg != null
       ? <String, dynamic>{'fn': agg[1]!.toLowerCase(), if (agg[2] != null && agg[2] != '*') 'column': agg[2], 'dir': d}
-      : <String, dynamic>{'column': col, 'dir': d};
+      : related != null
+          ? <String, dynamic>{'column': related[3], 'relation': related[2] == null ? related[1] : '${related[1]}!${related[2]}', 'dir': d}
+          : <String, dynamic>{'column': col, 'dir': d};
   if (nulls == 'first' || nulls == 'last') term['nulls'] = nulls;
   return term;
+}
+
+/// Resolves a term's `relation` (a model relation name or a table, with an optional `!hint`) to a table and hint.
+Map<String, dynamic> _resolveOrder(Map<String, dynamic> term, TableContext ctx) {
+  final rel = term['relation'];
+  if (rel is! String) return term;
+  final target = ctx.orderRelation(rel);
+  final out = <String, dynamic>{...term, 'relation': target.table};
+  if (target.hint != null && term['hint'] == null) out['hint'] = target.hint;
+  return out;
 }
 
 List<Object> _selectItems(List<Object> columns) {
@@ -450,6 +480,9 @@ class PlexivoQuery implements Future<PlexivoResult> {
       });
   List<Map<String, dynamic>> get _embeds => ((_s['embeds'] as List?) ?? const []).cast<Map<String, dynamic>>();
 
+  /// The inner-join embeds: they filter rows, so `pluck` and `exists` keep them.
+  List<Map<String, dynamic>> get _innerJoins => _embeds.where((e) => e['inner'] == true).toList();
+
   /// This builder's filter tree, without soft-delete conditions.
   ///
   /// Null when there are no filters.
@@ -485,10 +518,19 @@ class PlexivoQuery implements Future<PlexivoResult> {
   PlexivoQuery orWhereNot(Object column, [Object? op = _absent, Object? value = _absent]) => _term('or', {'not': condition(column, op, value, _ctx)});
 
   /// Keeps rows whose [column] is one of [values] (`IN`).
-  PlexivoQuery whereIn(String column, List<Object?> values) => where(column, 'in', values);
+  ///
+  /// [values] is a list, or a query that selects one column: a subquery, as
+  /// GORM's `Where("author_id IN (?)", db.Table("profiles").Select("id"))`.
+  /// The subquery runs as the caller, under its own table's row-level security.
+  ///
+  /// ```dart
+  /// final indian = db.from('profiles').select('id').where('country', 'IN');
+  /// final posts = await db.from('posts').whereIn('author_id', indian);
+  /// ```
+  PlexivoQuery whereIn(String column, Object values) => where(column, 'in', values);
 
-  /// Keeps rows whose [column] is none of [values] (`NOT IN`).
-  PlexivoQuery whereNotIn(String column, List<Object?> values) => where(column, 'not in', values);
+  /// Keeps rows whose [column] is none of [values] (`NOT IN`): a list, or a one-column subquery as for [whereIn].
+  PlexivoQuery whereNotIn(String column, Object values) => where(column, 'not in', values);
 
   /// Keeps rows where [column] is null.
   PlexivoQuery whereNull(String column) => where(column, 'is', null);
@@ -590,10 +632,10 @@ class PlexivoQuery implements Future<PlexivoResult> {
   /// Named so because `is` is a Dart keyword.
   PlexivoQuery isFilter(String column, Object? value) => where(column, 'is', value);
 
-  /// Supabase's `in`: [column] is one of [values].
+  /// Supabase's `in`: [column] is one of [values], a list or a one-column subquery.
   ///
   /// Named so because `in` is a Dart keyword.
-  PlexivoQuery inFilter(String column, List<Object?> values) => where(column, 'in', values);
+  PlexivoQuery inFilter(String column, Object values) => where(column, 'in', values);
 
   /// Supabase-style: [column] contains [value] (`@>`).
   PlexivoQuery contains(String column, Object value) => where(column, 'contains', value);
@@ -666,9 +708,57 @@ class PlexivoQuery implements Future<PlexivoResult> {
   /// `'title desc'` in [column] works too. [nulls] is `'first'` or `'last'`.
   /// After [groupBy], [column] can be an aggregate such as `count(*)` or
   /// `sum(likes)`. Throws an [ArgumentError] for any other direction.
+  ///
+  /// A dotted name orders by a column of a related row, as GORM's
+  /// `Joins("Author").Order("Author.name")`: `relation.column`, where the
+  /// relation is a model relation name or a table, optionally with a
+  /// foreign-key hint (`profiles!posts_author_id_fkey.username`). The relation
+  /// must be to-one (a belongs-to or has-one); a row without one sorts as null.
+  ///
+  /// ```dart
+  /// await db.from('posts').order('profiles.username', 'asc', 'last').order('id');
+  /// ```
+  ///
+  /// To order the rows of an embed instead, use [orderReferenced] or the
+  /// embed's own `order`.
   PlexivoQuery order(Object column, [Object? dir, String? nulls]) => _with({
-        'order': [...((_s['order'] as List?) ?? const []), _orderTerm(column, dir is String ? dir : null, dir is bool ? dir : null, nulls)]
+        'order': [...((_s['order'] as List?) ?? const []), _resolveOrder(_orderTerm(column, dir is String ? dir : null, dir is bool ? dir : null, nulls), _ctx)]
       });
+
+  /// Orders the rows of the embed [referencedTable] by [column], as Supabase's `order(column, referencedTable: …)`.
+  ///
+  /// [referencedTable] is the embed's name (its alias, or the table or
+  /// relation it embeds) in this query's [select] or [preload]. [dir] and
+  /// [nulls] are as for [order]. The parent rows keep their own order.
+  ///
+  /// ```dart
+  /// await db.from('posts')
+  ///     .select('id, title, comments(id, body)')
+  ///     .orderReferenced('comments', 'id', 'desc');
+  /// ```
+  ///
+  /// Throws an [ArgumentError] when the query has no such embed.
+  PlexivoQuery orderReferenced(String referencedTable, String column, [Object? dir, String? nulls]) {
+    final term = _orderTerm(column, dir is String ? dir : null, dir is bool ? dir : null, nulls);
+    final embeds = [..._embeds];
+    final i = embeds.indexWhere((e) => e['as'] == referencedTable || e['embed'] == referencedTable || (e['__m2m'] as Map?)?['as'] == referencedTable);
+    if (i < 0) throw ArgumentError('orderReferenced: embed $referencedTable in select() or preload() first');
+    final e = embeds[i];
+    final m2m = e['__m2m'] as Map?;
+    embeds[i] = m2m != null
+        ? {
+            ...e,
+            '__m2m': {
+              ...m2m,
+              'order': [...((m2m['order'] as List?) ?? const []), term]
+            }
+          }
+        : {
+            ...e,
+            'order': [...((e['order'] as List?) ?? const []), term]
+          };
+    return _with({'embeds': embeds});
+  }
 
   /// Orders rows; the same as [order].
   PlexivoQuery orderBy(Object column, [Object? dir, String? nulls]) => order(column, dir, nulls);
@@ -706,14 +796,18 @@ class PlexivoQuery implements Future<PlexivoResult> {
   /// q.preload('author', (PlexivoEmbed a) => a.select('name'))
   ///  .preload('comments', (PlexivoEmbed c) => c.where('approved', true).order('id').limit(5));
   /// ```
-  PlexivoQuery preload(String relation, [Function? callback]) => _with({
-        'embeds': [..._embeds, _ctx.embed(relation, callback, false)]
-      });
+  ///
+  /// A dotted path preloads through several relations, as GORM's
+  /// `Preload("Comments.Author")`: `preload('comments.author')` returns each
+  /// post's comments, each with its author. [callback] then shapes the last
+  /// relation of the path, and a path that starts with an embed already in
+  /// the query adds to it.
+  PlexivoQuery preload(String relation, [Function? callback]) => _with({'embeds': _addEmbed(_ctx, _embeds, relation, callback, false)});
 
   /// Like [preload], but keeps only rows with at least one matching related row (an inner join).
-  PlexivoQuery joins(String relation, [Function? callback]) => _with({
-        'embeds': [..._embeds, _ctx.embed(relation, callback, true)]
-      });
+  ///
+  /// A dotted path (`joins('comments.author')`) is an inner join at every step.
+  PlexivoQuery joins(String relation, [Function? callback]) => _with({'embeds': _addEmbed(_ctx, _embeds, relation, callback, true)});
 
   /// Adds the number of related rows as `<relation>_count`, or [as].
   ///
@@ -846,6 +940,15 @@ class PlexivoQuery implements Future<PlexivoResult> {
     return nodes.length == 1 ? nodes.first : {'and': nodes};
   }
 
+  /// The filter for aggregates: [_where] plus each inner join as a "related row exists" condition.
+  Map<String, dynamic>? _aggregateWhere() {
+    final joins = _innerJoins.map(_hasOf).toList();
+    final base = _where();
+    final all = [if (base != null) base, ...joins];
+    if (all.isEmpty) return null;
+    return all.length == 1 ? all.first : {'and': all};
+  }
+
   Map<String, dynamic> _writeWhere(String op) {
     if (node() == null && _s['allowGlobal'] != true) {
       throw PlexivoException(400, 'missing_where', message: 'an $op must say which rows it touches: add where(), or allowGlobalUpdate() to touch every row');
@@ -874,6 +977,19 @@ class PlexivoQuery implements Future<PlexivoResult> {
       'lock': _s['lock'],
       ...extra,
     });
+  }
+
+  /// This query as a subquery for `whereIn` / `whereNotIn`: `{from, select, where}`.
+  ///
+  /// The query must select exactly one column, such as `select('id')`, and
+  /// have no embeds. Throws an [ArgumentError] otherwise.
+  Map<String, dynamic> toSubquery() {
+    final cols = ((_s['select'] as List?) ?? const []).where((c) => c != '*').toList();
+    if (cols.length != 1 || _embeds.isNotEmpty) {
+      throw ArgumentError('A subquery selects exactly one column, such as select(\'id\'), and no related rows');
+    }
+    final c = cols.first;
+    return _clean({'from': table, 'select': c is Map ? c['column'] : c, 'where': _where()});
   }
 
   /// Inside a transaction, a reference to a value from this operation's first row, for a later operation.
@@ -1041,21 +1157,21 @@ class PlexivoQuery implements Future<PlexivoResult> {
   /// The values of one [column], one per matching row.
   Future<List<dynamic>> pluck(String column) async => (await _with({
         'select': [column],
-        'embeds': <Object>[]
+        'embeds': _innerJoins
       }).find())
           .map((r) => r[column])
           .toList();
 
   /// The number of matching rows; limit, offset and order are ignored.
   Future<int> count() async {
-    final r = await _ctx.run(_clean({'op': 'aggregate', 'from': table, 'where': _where(), 'count': true}));
+    final r = await _ctx.run(_clean({'op': 'aggregate', 'from': table, 'where': _aggregateWhere(), 'count': true}));
     return ((r['data'] as Map)['count'] as num).toInt();
   }
 
   /// Whether at least one row matches.
   Future<bool> exists() async => (await limit(1)._with({
         'select': [_ctx.primaryKey],
-        'embeds': <Object>[]
+        'embeds': _innerJoins
       }).find())
           .isNotEmpty;
 
@@ -1098,7 +1214,7 @@ class PlexivoQuery implements Future<PlexivoResult> {
       final r = await _ctx.run(_clean({
         'op': 'aggregate',
         'from': table,
-        'where': _where(),
+        'where': _aggregateWhere(),
         'group_by': group,
         'having': having.isEmpty ? null : (having.length == 1 ? having.first : {'and': having}),
         'order': _s['order'],
@@ -1111,7 +1227,7 @@ class PlexivoQuery implements Future<PlexivoResult> {
   }
 
   Future<Map<String, dynamic>> _aggregate(Map<String, dynamic> spec) async {
-    final r = await _ctx.run(_clean({'op': 'aggregate', 'from': table, 'where': _where(), ..._aggSpec(spec)}));
+    final r = await _ctx.run(_clean({'op': 'aggregate', 'from': table, 'where': _aggregateWhere(), ..._aggSpec(spec)}));
     return Map<String, dynamic>.from(r['data'] as Map);
   }
 
@@ -1560,8 +1676,11 @@ class PlexivoEmbed {
   /// Adds a negated filter, `NOT (…)`, joined with AND.
   PlexivoEmbed whereNot(Object column, [Object? op = _absent, Object? value = _absent]) => _term('and', {'not': condition(column, op, value, _ctx)});
 
-  /// Keeps related rows whose [column] is one of [values].
-  PlexivoEmbed whereIn(String column, List<Object?> values) => where(column, 'in', values);
+  /// Keeps related rows whose [column] is one of [values]: a list, or a one-column subquery.
+  PlexivoEmbed whereIn(String column, Object values) => where(column, 'in', values);
+
+  /// Keeps related rows whose [column] is none of [values]: a list, or a one-column subquery.
+  PlexivoEmbed whereNotIn(String column, Object values) => where(column, 'not in', values);
 
   /// Keeps related rows where [column] is null.
   PlexivoEmbed whereNull(String column) => where(column, 'is', null);
@@ -1585,7 +1704,7 @@ class PlexivoEmbed {
 
   /// Orders the related rows; see [PlexivoQuery.order].
   PlexivoEmbed order(Object column, [Object? dir, String? nulls]) => _with({
-        'order': [...((_s['order'] as List?) ?? const []), _orderTerm(column, dir is String ? dir : null, dir is bool ? dir : null, nulls)]
+        'order': [...((_s['order'] as List?) ?? const []), _resolveOrder(_orderTerm(column, dir is String ? dir : null, dir is bool ? dir : null, nulls), _ctx)]
       });
 
   /// Returns at most [n] related rows per row.
@@ -1594,15 +1713,13 @@ class PlexivoEmbed {
   /// Skips the first [n] related rows per row.
   PlexivoEmbed offset(int n) => _with({'offset': n});
 
-  /// Also returns the related rows' own [relation]; see [PlexivoQuery.preload].
-  PlexivoEmbed preload(String relation, [Function? callback]) => _with({
-        'embeds': [...((_s['embeds'] as List?) ?? const []), _ctx.embed(relation, callback, false)]
-      });
+  /// Also returns the related rows' own [relation], or a dotted path of relations; see [PlexivoQuery.preload].
+  PlexivoEmbed preload(String relation, [Function? callback]) =>
+      _with({'embeds': _addEmbed(_ctx, ((_s['embeds'] as List?) ?? const []).cast<Map<String, dynamic>>(), relation, callback, false)});
 
   /// Keeps related rows with a matching row through [relation]; see [PlexivoQuery.joins].
-  PlexivoEmbed joins(String relation, [Function? callback]) => _with({
-        'embeds': [...((_s['embeds'] as List?) ?? const []), _ctx.embed(relation, callback, true)]
-      });
+  PlexivoEmbed joins(String relation, [Function? callback]) =>
+      _with({'embeds': _addEmbed(_ctx, ((_s['embeds'] as List?) ?? const []).cast<Map<String, dynamic>>(), relation, callback, true)});
 
   /// Adds the number of the related rows' own [relation] rows; see [PlexivoQuery.withCount].
   PlexivoEmbed withCount(String relation, [Function? callback, String? as]) => _with({
@@ -1628,4 +1745,279 @@ Map<String, dynamic> _pick(Map<String, dynamic> row, List<String>? omit, List<St
   if (only != null) out.removeWhere((k, _) => !only.contains(k));
   if (omit != null) out.removeWhere((k, _) => omit.contains(k));
   return out;
+}
+
+/// Adds the embed for [relation] (a name, or a dotted path of names) to [embeds].
+///
+/// A path whose first step is already embedded nests into that embed.
+List<Map<String, dynamic>> _addEmbed(TableContext ctx, List<Map<String, dynamic>> embeds, String relation, Function? callback, bool inner) {
+  final dot = relation.indexOf('.');
+  if (dot < 0) return [...embeds, ctx.embed(relation, callback, inner)];
+  final head = relation.substring(0, dot);
+  final rest = relation.substring(dot + 1);
+  final i = embeds.indexWhere((e) => e['as'] == head || (e['__m2m'] as Map?)?['as'] == head);
+  if (i < 0) {
+    return [
+      ...embeds,
+      ctx.embed(head, (PlexivoEmbed e) => inner ? e.joins(rest, callback) : e.preload(rest, callback), inner),
+    ];
+  }
+  Map<String, dynamic> nest(Map<String, dynamic> e) {
+    final child = PlexivoEmbed(ctx.child(e['embed'] as String));
+    final built = inner ? child.joins(rest, callback) : child.preload(rest, callback);
+    final item = ((built.state['embeds'] as List).last as Map).cast<String, dynamic>();
+    final select = (e['select'] as List?)?.cast<Object>();
+    final kept = select?.where((x) => !(x is Map && x['as'] == item['as'])).toList();
+    return {
+      ...e,
+      'select': [
+        ...(kept ?? const ['*']),
+        item
+      ]
+    };
+  }
+
+  final existing = embeds[i];
+  final out = [...embeds];
+  if (existing['__m2m'] != null) {
+    final target = ((existing['select'] as List).first as Map).cast<String, dynamic>();
+    out[i] = {
+      ...existing,
+      'select': [nest(target)]
+    };
+  } else {
+    out[i] = nest(existing);
+  }
+  return out;
+}
+
+/// A call to a database function, awaitable as before and chainable like a query.
+///
+/// Get one from [PlexivoClient.rpc]. Awaiting it as it is calls the function
+/// and returns its result decoded from JSON, exactly as in 0.3. For a function
+/// that returns rows (`RETURNS SETOF <table>` or `RETURNS TABLE (…)`), chain
+/// filters, order, paging, a count and, for `SETOF` a table, related rows;
+/// the database applies them to the function's rows, and the result is a
+/// [PlexivoResult].
+///
+/// ```dart
+/// final total = await db.rpc('cart_total', {'cart_id': 7});        // a number
+///
+/// final hits = await db.rpc('search_posts', {'q': 'postgres'})
+///     .select('id, title, author:profiles(username)', 'exact')
+///     .gte('likes', 10)
+///     .order('likes', 'desc')
+///     .range(0, 9);
+/// print('${hits.length} of ${hits.count}');
+///
+/// final top = await db.rpc('search_posts', {'q': 'postgres'}).order('likes', 'desc').limit(1).single();
+/// ```
+///
+/// Only functions exposed with `COMMENT ON FUNCTION … IS '@expose'` can be
+/// called, and they run as the signed-in user (or anonymously). Failures throw
+/// a [PlexivoException].
+class PlexivoRpc implements Future<dynamic> {
+  /// Creates a call to [function] with [args]; use [PlexivoClient.rpc] instead.
+  ///
+  /// [query] holds the chained filters and [plain] makes the unchained call.
+  PlexivoRpc(this.function, this.args, PlexivoQuery query, Future<dynamic> Function() plain)
+      : _q = query,
+        _plain = plain;
+
+  /// The function's name.
+  final String function;
+
+  /// The named arguments passed to the function.
+  final Map<String, dynamic> args;
+
+  final PlexivoQuery _q;
+  final Future<dynamic> Function() _plain;
+  Future<dynamic>? _run;
+
+  PlexivoRpc _wrap(PlexivoQuery q) => PlexivoRpc(function, args, q, _plain);
+
+  bool get _chained {
+    final s = _q._s;
+    return _q._terms.isNotEmpty ||
+        ((s['select'] as List?) ?? const []).isNotEmpty ||
+        _q._embeds.isNotEmpty ||
+        ((s['order'] as List?) ?? const []).isNotEmpty ||
+        s['limit'] != null ||
+        s['offset'] != null ||
+        s['count'] == true;
+  }
+
+  /// The structured operation a chained call sends (`POST /query/v1`), without running it.
+  Map<String, dynamic> toQuery() {
+    final read = _q.toQuery();
+    return _clean({
+      'op': 'rpc',
+      'function': function,
+      'args': args,
+      'select': read['select'],
+      'where': read['where'],
+      'order': read['order'],
+      'limit': read['limit'],
+      'offset': read['offset'],
+      'count': _q._s['count'] == true ? true : null,
+    })
+      ..putIfAbsent('args', () => <String, dynamic>{});
+  }
+
+  Future<dynamic> _execute() => _run ??= _chained ? _runChained() : _plain();
+
+  Future<dynamic> _runChained() async {
+    final r = await _q._ctx.run(toQuery());
+    final data = r['data'];
+    final count = (r['count'] as num?)?.toInt();
+    if (data is List && data.every((e) => e is Map)) {
+      final rows = _q._ctx.shape(_rows(data), _q._embeds);
+      return PlexivoResult(_q._s['head'] == true ? [] : rows, count ?? rows.length);
+    }
+    return data;
+  }
+
+  // ── chaining: the same names as PlexivoQuery ─────────────────────────────
+
+  /// Chooses the columns, and for `SETOF` a table, related rows; see [PlexivoQuery.select].
+  ///
+  /// Pass `'exact'` as [count] to also get the total number of matching rows
+  /// in [PlexivoResult.count], and [head] for only that total.
+  PlexivoRpc select([Object? columns, String? count, bool head = false]) => _wrap(_q.select(columns, count, head));
+
+  /// Adds a filter on the function's rows, joined with AND; see [PlexivoQuery.where].
+  PlexivoRpc where(Object column, [Object? op = _absent, Object? value = _absent]) => _wrap(_q.where(column, op, value));
+
+  /// Adds a filter joined with OR; see [PlexivoQuery.orWhere].
+  PlexivoRpc orWhere(Object column, [Object? op = _absent, Object? value = _absent]) => _wrap(_q.orWhere(column, op, value));
+
+  /// Adds a negated filter; see [PlexivoQuery.whereNot].
+  PlexivoRpc whereNot(Object column, [Object? op = _absent, Object? value = _absent]) => _wrap(_q.whereNot(column, op, value));
+
+  /// Keeps rows whose [column] is one of [values]; see [PlexivoQuery.whereIn].
+  PlexivoRpc whereIn(String column, Object values) => _wrap(_q.whereIn(column, values));
+
+  /// Keeps rows whose [column] is none of [values]; see [PlexivoQuery.whereNotIn].
+  PlexivoRpc whereNotIn(String column, Object values) => _wrap(_q.whereNotIn(column, values));
+
+  /// Keeps rows where [column] is null.
+  PlexivoRpc whereNull(String column) => _wrap(_q.whereNull(column));
+
+  /// Keeps rows where [column] is not null.
+  PlexivoRpc whereNotNull(String column) => _wrap(_q.whereNotNull(column));
+
+  /// Supabase-style: [column] equals [value].
+  PlexivoRpc eq(String column, Object? value) => _wrap(_q.eq(column, value));
+
+  /// Supabase-style: [column] does not equal [value].
+  PlexivoRpc neq(String column, Object? value) => _wrap(_q.neq(column, value));
+
+  /// Supabase-style: [column] is greater than [value].
+  PlexivoRpc gt(String column, Object? value) => _wrap(_q.gt(column, value));
+
+  /// Supabase-style: [column] is greater than or equal to [value].
+  PlexivoRpc gte(String column, Object? value) => _wrap(_q.gte(column, value));
+
+  /// Supabase-style: [column] is less than [value].
+  PlexivoRpc lt(String column, Object? value) => _wrap(_q.lt(column, value));
+
+  /// Supabase-style: [column] is less than or equal to [value].
+  PlexivoRpc lte(String column, Object? value) => _wrap(_q.lte(column, value));
+
+  /// Supabase-style: [column] matches [pattern] (`LIKE`).
+  PlexivoRpc like(String column, String pattern) => _wrap(_q.like(column, pattern));
+
+  /// Supabase-style: [column] matches [pattern], ignoring case (`ILIKE`).
+  PlexivoRpc ilike(String column, String pattern) => _wrap(_q.ilike(column, pattern));
+
+  /// Supabase's `is`: [column] `IS` [value] (null, true or false).
+  PlexivoRpc isFilter(String column, Object? value) => _wrap(_q.isFilter(column, value));
+
+  /// Supabase's `in`: [column] is one of [values].
+  PlexivoRpc inFilter(String column, Object values) => _wrap(_q.inFilter(column, values));
+
+  /// Supabase-style: [column] contains [value] (`@>`).
+  PlexivoRpc contains(String column, Object value) => _wrap(_q.contains(column, value));
+
+  /// Supabase-style: every column in [values] equals its value.
+  PlexivoRpc match(Map<String, Object?> values) => _wrap(_q.match(values));
+
+  /// Supabase-style negated filter; see [PlexivoQuery.not].
+  PlexivoRpc not(String column, String op, Object? value) => _wrap(_q.not(column, op, value));
+
+  /// Supabase-style OR group from a PostgREST logic string; see [PlexivoQuery.or].
+  PlexivoRpc or(String filters) => _wrap(_q.or(filters));
+
+  /// Supabase-style filter with a PostgREST operator; see [PlexivoQuery.filter].
+  PlexivoRpc filter(String column, String op, Object? value) => _wrap(_q.filter(column, op, value));
+
+  /// Orders the function's rows; see [PlexivoQuery.order].
+  PlexivoRpc order(Object column, [Object? dir, String? nulls]) => _wrap(_q.order(column, dir, nulls));
+
+  /// Returns at most [n] rows.
+  PlexivoRpc limit(int n) => _wrap(_q.limit(n));
+
+  /// Skips the first [n] rows.
+  PlexivoRpc offset(int n) => _wrap(_q.offset(n));
+
+  /// Returns rows [from] to [to], both included and counted from 0.
+  PlexivoRpc range(int from, int to) => _wrap(_q.range(from, to));
+
+  /// Returns page [number] (from 1) of [size] rows.
+  PlexivoRpc page(int number, [int size = 20]) => _wrap(_q.page(number, size));
+
+  /// For a function returning `SETOF` a table: also returns related rows; see [PlexivoQuery.preload].
+  PlexivoRpc preload(String relation, [Function? callback]) => _wrap(_q.preload(relation, callback));
+
+  /// Runs the call and returns exactly one row (or a function's single object) as a [PlexivoSingle].
+  ///
+  /// Throws a [RecordNotFoundException] for none and a [PlexivoException] with
+  /// code `multiple_rows` for more than one.
+  Future<PlexivoSingle> single() => _execute().then((v) => _one(v, true));
+
+  /// Like [single], but a [PlexivoSingle] whose `data` is null when there is no row.
+  Future<PlexivoSingle> maybeSingle() => _execute().then((v) => _one(v, false));
+
+  PlexivoSingle _one(Object? v, bool required) {
+    if (v is List) {
+      if (v.length > 1) throw PlexivoException(406, 'multiple_rows', message: 'more than one row from $function');
+      if (v.isEmpty) {
+        if (required) throw RecordNotFoundException(function);
+        return PlexivoSingle(null, 0);
+      }
+      final first = v.first;
+      return PlexivoSingle(first is Map ? Map<String, dynamic>.from(first) : {'value': first}, 1);
+    }
+    if (v == null) {
+      if (required) throw RecordNotFoundException(function);
+      return PlexivoSingle(null, 0);
+    }
+    return PlexivoSingle(v is Map ? Map<String, dynamic>.from(v) : {'value': v}, 1);
+  }
+
+  @override
+  Future<R> then<R>(FutureOr<R> Function(dynamic value) onValue, {Function? onError}) => _execute().then(onValue, onError: onError);
+  @override
+  Future<dynamic> catchError(Function onError, {bool Function(Object error)? test}) => _execute().catchError(onError, test: test);
+  @override
+  Future<dynamic> whenComplete(FutureOr<void> Function() action) => _execute().whenComplete(action);
+  @override
+  Future<dynamic> timeout(Duration timeLimit, {FutureOr<dynamic> Function()? onTimeout}) => _execute().timeout(timeLimit, onTimeout: onTimeout);
+  @override
+  Stream<dynamic> asStream() => _execute().asStream();
+}
+
+/// An inner-join embed as the filter node it implies: a matching related row exists.
+Map<String, dynamic> _hasOf(Map<String, dynamic> embed) {
+  final nested = ((embed['select'] as List?) ?? const []).whereType<Map>().where((x) => x['inner'] == true).map((x) => _hasOf(x.cast<String, dynamic>()));
+  final where = [if (embed['where'] != null) embed['where'] as Map<String, dynamic>, ...nested];
+  return _clean({
+    'has': embed['embed'],
+    'hint': embed['hint'],
+    'where': where.isEmpty
+        ? null
+        : where.length == 1
+            ? where.first
+            : {'and': where}
+  });
 }
