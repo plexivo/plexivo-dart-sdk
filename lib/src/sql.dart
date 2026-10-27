@@ -1,9 +1,25 @@
 import 'model.dart';
 
-/// Raw SQL and migrations, for servers with the project's secret key
-/// (POST /sql/v1). An app with the publishable key is refused by the
-/// platform whatever it sends. Statements in one call run in one transaction.
+/// Raw SQL and migrations, for servers holding the project's secret key.
+///
+/// **Server only.** Calls go to `POST /sql/v1`; with the publishable key the
+/// platform refuses them whatever they send. Never ship the secret key in a
+/// Flutter app. The statements in one call run in one transaction. `DateTime`
+/// parameters are sent as UTC ISO 8601.
+///
+/// ```dart
+/// // On a server:
+/// final server = PlexivoClient(dataUrl, Platform.environment['PLEXIVO_SECRET_KEY']!);
+///
+/// final big = await server.sql.raw(r'select * from orders where total > $1', [100]);
+/// await server.sql.transaction([
+///   r'update accounts set balance = balance - 10 where id = 1',
+///   {'sql': r'update accounts set balance = balance + $1 where id = $2', 'params': [10, 2]},
+/// ]);
+/// await server.migrator.autoMigrate([postModel, commentModel]);
+/// ```
 class PlexivoSql {
+  /// Creates the SQL API over a request function; use [PlexivoClient.sql].
   PlexivoSql(this._call);
 
   final Future<Map<String, dynamic>> Function(String path, Map<String, dynamic> body) _call;
@@ -18,25 +34,45 @@ class PlexivoSql {
       ]))
           .first;
 
-  /// Rows from `sql` with `$1`, `$2` … parameters.
+  /// Runs [sql] with `$1`, `$2` … [params] and returns its rows.
+  ///
+  /// Always pass values as [params], never by building the SQL string.
   Future<List<Map<String, dynamic>>> raw(String sql, [List<Object?> params = const []]) async =>
       ((await _one(sql, params))['rows'] as List? ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
-  /// Runs a statement: `{command, rowCount}`.
+  /// Runs a statement and returns its `command` tag and `rowCount`.
+  ///
+  /// `command` is, for example, `UPDATE`; `rowCount` is the number of rows it
+  /// touched.
   Future<({String? command, int rowCount})> exec(String sql, [List<Object?> params = const []]) async {
     final r = await _one(sql, params);
     return (command: r['command'] as String?, rowCount: (r['row_count'] as num?)?.toInt() ?? 0);
   }
 
-  /// Several statements in one transaction: each result.
+  /// Runs several [statements] in one transaction and returns each result.
+  ///
+  /// Each statement is SQL text, or `{'sql': …, 'params': [...]}`.
   Future<List<Map<String, dynamic>>> transaction(List<Object> statements) => _run([
         for (final s in statements)
           s is String ? {'sql': s, 'params': <Object?>[]} : {'sql': (s as Map)['sql'], 'params': ((s['params'] as List?) ?? const []).map(_param).toList()}
       ]);
 
+  /// Schema inspection and changes, like GORM's Migrator.
   late final PlexivoMigrator migrator = PlexivoMigrator._(_run, _one);
 
-  /// Versioned migrations, each applied once, in order, recorded in `plexivo_migrations`.
+  /// Applies the [migrations] not yet applied, in list order, and returns their ids.
+  ///
+  /// Applied ids are recorded in [table] (`plexivo_migrations`, created if
+  /// missing). Each migration runs in its own transaction with its record, so a
+  /// failure leaves earlier ones applied and stops there. Run migrations from one
+  /// place at a time.
+  ///
+  /// ```dart
+  /// await server.migrate([
+  ///   PlexivoMigration.sql('001_slug',
+  ///       'alter table posts add column slug text', 'alter table posts drop column slug'),
+  /// ]);
+  /// ```
   Future<List<String>> migrate(List<PlexivoMigration> migrations, {String table = 'plexivo_migrations'}) async {
     await _run([
       {'sql': 'CREATE TABLE IF NOT EXISTS ${_ident(table)} (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())', 'params': <Object?>[]}
@@ -59,7 +95,10 @@ class PlexivoSql {
     return applied;
   }
 
-  /// Undoes the newest `steps` applied migrations with their `down`.
+  /// Undoes the newest [steps] applied migrations with their `down`, and returns their ids.
+  ///
+  /// Throws a [StateError] if an applied migration is missing from
+  /// [migrations] or has no `down`.
   Future<List<String>> rollback(List<PlexivoMigration> migrations, {int steps = 1, String table = 'plexivo_migrations'}) async {
     final rows = (await _one('SELECT id FROM ${_ident(table)} ORDER BY applied_at DESC, id DESC LIMIT \$1', [steps]))['rows'] as List;
     final undone = <String>[];
@@ -82,17 +121,38 @@ class PlexivoSql {
   }
 }
 
-/// One versioned migration: `up` and optional `down` add statements to a plan.
+/// One versioned migration: `up`, and optionally `down`, add statements to a plan.
+///
+/// ```dart
+/// final migrations = [
+///   PlexivoMigration.sql('001_posts',
+///       'create table posts (id bigint generated always as identity primary key, title text not null)',
+///       'drop table posts'),
+///   PlexivoMigration('002_slug',
+///       (plan) => plan.addColumn('posts', 'slug', 'text').createIndex('posts', ['slug'], unique: true),
+///       (plan) => plan.dropColumn('posts', 'slug')),
+/// ];
+/// await server.migrate(migrations);
+/// await server.rollback(migrations); // undoes 002_slug
+/// ```
 class PlexivoMigration {
+  /// Creates migration [id] from [up] and an optional [down].
+  ///
+  /// [id] is unique and never changes once applied, such as `001_create_posts`.
   PlexivoMigration(this.id, this.up, [this.down]);
 
-  /// Plain SQL migrations.
+  /// Creates migration [id] from plain SQL: [upSql], and optionally [downSql].
   PlexivoMigration.sql(this.id, String upSql, [String? downSql])
       : up = ((p) => p.sql(upSql)),
         down = downSql == null ? null : ((p) => p.sql(downSql));
 
+  /// The migration's unique id, recorded once it is applied.
   final String id;
+
+  /// Adds the statements that apply this migration.
   final void Function(PlexivoMigrationPlan plan) up;
+
+  /// Adds the statements that undo this migration, or null if it cannot be undone.
   final void Function(PlexivoMigrationPlan plan)? down;
 }
 
@@ -105,8 +165,18 @@ List<String> _split(String table) {
   return parts.length == 2 ? parts : ['public', parts.first];
 }
 
-/// A column as SQL: `'text not null'`, or `{type, primaryKey, identity, notNull,
-/// unique, default (SQL), references: 'table(col)', onDelete, onUpdate, check, index}`.
+/// A column definition as SQL, for column [name] and its definition [def].
+///
+/// [def] is SQL text, such as `'text not null'`, or a map with `type` and
+/// optionally `primaryKey`, `identity`, `notNull` (or `nullable: false`),
+/// `unique`, `default` (SQL), `check` (SQL), `references` (`'table(column)'`),
+/// `onDelete`, `onUpdate` and `index` (true, or index options). Throws an
+/// [ArgumentError] when a map has no `type` or an unreadable `references`.
+///
+/// ```dart
+/// columnSql('author_id', {'type': 'bigint', 'notNull': true, 'references': 'authors(id)', 'onDelete': 'cascade'});
+/// // "author_id" bigint NOT NULL REFERENCES "authors" ("id") ON DELETE CASCADE
+/// ```
 String columnSql(String name, Object def) {
   if (def is String) return '${_ident(name)} $def';
   final d = def as Map;
@@ -183,7 +253,19 @@ List<Map<String, dynamic>> _security(String table, List<Map<String, dynamic>> po
       for (final p in policies) _policySql(table, p),
     ];
 
-/// The migrator (GORM's Migrator interface): inspect and change the schema.
+/// Inspects and changes the schema, like GORM's Migrator.
+///
+/// **Server only, with the secret key.** Each change runs at once, in its own
+/// transaction. Tables are `table` (in `public`) or `schema.table`. To group
+/// changes, use [plan] with a [PlexivoMigration].
+///
+/// ```dart
+/// final m = server.migrator;
+/// if (!await m.hasColumn('posts', 'slug')) {
+///   await m.addColumn('posts', 'slug', 'text');
+///   await m.createIndex('posts', ['slug'], unique: true);
+/// }
+/// ```
 class PlexivoMigrator {
   PlexivoMigrator._(this._run, this._one);
   final Future<List<Map<String, dynamic>>> Function(List<Map<String, dynamic>>) _run;
@@ -191,17 +273,26 @@ class PlexivoMigrator {
 
   Future<bool> _ok(String sql, List<Object?> params) async => ((await _one(sql, params))['rows'] as List).first['ok'] == true;
 
+  /// Whether [table] exists.
   Future<bool> hasTable(String table) => _ok('SELECT to_regclass(\$1) IS NOT NULL AS ok', [_split(table).map((p) => '"$p"').join('.')]);
+
+  /// Whether [table] has [column].
   Future<bool> hasColumn(String table, String column) => _ok(
       'SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = \$1 AND table_name = \$2 AND column_name = \$3) AS ok',
       [..._split(table), column]);
+
+  /// The columns of [table], in order: `name`, `type`, `nullable` and `default`.
   Future<List<Map<String, dynamic>>> columns(String table) async => ((await _one(
           'SELECT column_name AS name, data_type AS type, is_nullable = \'YES\' AS nullable, column_default AS "default" FROM information_schema.columns WHERE table_schema = \$1 AND table_name = \$2 ORDER BY ordinal_position',
           _split(table)))['rows'] as List)
       .map((e) => Map<String, dynamic>.from(e as Map))
       .toList();
 
-  /// Creates missing tables, columns, indexes and policies for these models; never drops or changes anything.
+  /// Creates the missing tables, columns and indexes for [models], and returns the SQL it ran.
+  ///
+  /// It never drops or changes anything. New tables also get their policies and
+  /// row-level security; existing tables only gain missing columns and indexes.
+  /// Throws an [ArgumentError] if a model has no [PlexivoModel.columns].
   Future<List<String>> autoMigrate(List<PlexivoModel> models) async {
     final statements = <Map<String, dynamic>>[];
     for (final m in models) {
@@ -223,53 +314,100 @@ class PlexivoMigrator {
     return statements.map((s) => s['sql'] as String).toList();
   }
 
+  /// Creates [table] with [columns], if it does not exist, plus its [indexes] and [policies].
+  ///
+  /// Policies also turn on row-level security. Use [compositeKey] for a key
+  /// over several columns.
   Future<void> createTable(String table, Map<String, Object> columns,
           {List<Map<String, dynamic>> indexes = const [], List<Map<String, dynamic>> policies = const [], List<String>? compositeKey}) =>
       _run([..._createTable(table, columns, compositeKey: compositeKey), ..._indexes(table, indexes, columns), ..._security(table, policies, null)]);
+
+  /// Drops [table] if it exists; [cascade] also drops what depends on it.
   Future<void> dropTable(String table, {bool cascade = false}) => _run([_stmt('DROP TABLE IF EXISTS ${_ident(table)}${cascade ? ' CASCADE' : ''}')]);
+
+  /// Renames table [from] to [to].
   Future<void> renameTable(String from, String to) => _run([_stmt('ALTER TABLE ${_ident(from)} RENAME TO ${_ident(to)}')]);
+
+  /// Adds column [name] with definition [def] (see [columnSql]), if missing.
   Future<void> addColumn(String table, String name, Object def) =>
       _run([_stmt('ALTER TABLE ${_ident(table)} ADD COLUMN IF NOT EXISTS ${columnSql(name, def)}')]);
+
+  /// Drops column [name] from [table], if it exists.
   Future<void> dropColumn(String table, String name) => _run([_stmt('ALTER TABLE ${_ident(table)} DROP COLUMN IF EXISTS ${_ident(name)}')]);
+
+  /// Renames column [from] of [table] to [to].
   Future<void> renameColumn(String table, String from, String to) =>
       _run([_stmt('ALTER TABLE ${_ident(table)} RENAME COLUMN ${_ident(from)} TO ${_ident(to)}')]);
+
+  /// Changes the type of column [name] to [type], converting with [using] when given.
   Future<void> alterColumnType(String table, String name, String type, {String? using}) =>
       _run([_stmt('ALTER TABLE ${_ident(table)} ALTER COLUMN ${_ident(name)} TYPE $type${using == null ? '' : ' USING $using'}')]);
+
+  /// Creates an index on [columns] of [table], if it does not exist.
+  ///
+  /// [unique] makes it unique; [name] defaults to `<table>_<columns>_idx` (or
+  /// `_key`); [using] picks the method, such as `gin`; [where] makes it partial.
   Future<void> createIndex(String table, List<String> columns, {bool unique = false, String? name, String? using, String? where}) => _run(_indexes(
       table,
       [
         {'columns': columns, 'unique': unique, if (name != null) 'name': name, if (using != null) 'using': using, if (where != null) 'where': where}
       ],
       null));
+
+  /// Drops index [name], if it exists.
   Future<void> dropIndex(String name) => _run([_stmt('DROP INDEX IF EXISTS ${_ident(name)}')]);
+
+  /// Turns on row-level security for [table].
   Future<void> enableRowLevelSecurity(String table) => _run([_stmt('ALTER TABLE ${_ident(table)} ENABLE ROW LEVEL SECURITY')]);
+
+  /// Creates a row-level security [policy] on [table].
+  ///
+  /// See [PlexivoModel.policies] for its keys.
   Future<void> createPolicy(String table, Map<String, dynamic> policy) => _run([_policySql(table, policy)]);
+
+  /// Drops policy [name] from [table], if it exists.
   Future<void> dropPolicy(String table, String name) => _run([_stmt('DROP POLICY IF EXISTS ${_ident(name)} ON ${_ident(table)}')]);
 
-  /// Collects changes to run later, together.
+  /// Starts a plan: changes collected to run later, together.
   PlexivoMigrationPlan plan() => PlexivoMigrationPlan._();
 }
 
-/// Statements collected for one migration.
+/// Statements collected for one migration, run together in one transaction.
+///
+/// Each method adds a statement and returns the plan, so calls chain. Use
+/// [sql] for anything else, such as renaming a table.
 class PlexivoMigrationPlan {
   PlexivoMigrationPlan._();
+
+  /// The statements so far, each `{'sql': …, 'params': [...]}`.
   final List<Map<String, dynamic>> statements = [];
 
+  /// Adds SQL [text] with `$1`, `$2` … [params].
   PlexivoMigrationPlan sql(String text, [List<Object?> params = const []]) {
     statements.add({'sql': text, 'params': params.map(_param).toList()});
     return this;
   }
 
+  /// Adds creating [table] with [columns], [indexes] and [policies]; see [PlexivoMigrator.createTable].
   PlexivoMigrationPlan createTable(String table, Map<String, Object> columns,
       {List<Map<String, dynamic>> indexes = const [], List<Map<String, dynamic>> policies = const [], List<String>? compositeKey}) {
     statements.addAll([..._createTable(table, columns, compositeKey: compositeKey), ..._indexes(table, indexes, columns), ..._security(table, policies, null)]);
     return this;
   }
 
+  /// Adds dropping [table]; [cascade] also drops what depends on it.
   PlexivoMigrationPlan dropTable(String table, {bool cascade = false}) => sql('DROP TABLE IF EXISTS ${_ident(table)}${cascade ? ' CASCADE' : ''}');
+
+  /// Adds adding column [name] with definition [def] (see [columnSql]).
   PlexivoMigrationPlan addColumn(String table, String name, Object def) => sql('ALTER TABLE ${_ident(table)} ADD COLUMN IF NOT EXISTS ${columnSql(name, def)}');
+
+  /// Adds dropping column [name] from [table].
   PlexivoMigrationPlan dropColumn(String table, String name) => sql('ALTER TABLE ${_ident(table)} DROP COLUMN IF EXISTS ${_ident(name)}');
+
+  /// Adds renaming column [from] of [table] to [to].
   PlexivoMigrationPlan renameColumn(String table, String from, String to) => sql('ALTER TABLE ${_ident(table)} RENAME COLUMN ${_ident(from)} TO ${_ident(to)}');
+
+  /// Adds an index on [columns] of [table]; [unique] and [name] as in [PlexivoMigrator.createIndex].
   PlexivoMigrationPlan createIndex(String table, List<String> columns, {bool unique = false, String? name}) {
     statements.addAll(_indexes(
         table,
@@ -280,8 +418,13 @@ class PlexivoMigrationPlan {
     return this;
   }
 
+  /// Adds dropping index [name].
   PlexivoMigrationPlan dropIndex(String name) => sql('DROP INDEX IF EXISTS ${_ident(name)}');
+
+  /// Adds turning on row-level security for [table].
   PlexivoMigrationPlan enableRowLevelSecurity(String table) => sql('ALTER TABLE ${_ident(table)} ENABLE ROW LEVEL SECURITY');
+
+  /// Adds a row-level security [policy] on [table]; see [PlexivoModel.policies].
   PlexivoMigrationPlan createPolicy(String table, Map<String, dynamic> policy) {
     statements.add(_policySql(table, policy));
     return this;

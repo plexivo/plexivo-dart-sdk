@@ -11,20 +11,60 @@ import 'query.dart';
 import 'realtime.dart';
 import 'sql.dart';
 
-/// The client for Plexivo Postgres: data (Supabase-style and GORM-style on
-/// one builder), models, transactions, auth, storage, realtime, GraphQL,
-/// functions and — with the secret key, on a server — raw SQL and migrations.
+/// The client for one Plexivo Postgres database.
+///
+/// One object for the Data API (Supabase-style and GORM-style queries on one
+/// builder), models, transactions, authentication, file storage, realtime,
+/// GraphQL and Plexivo Functions. With the secret key, on a server, it also
+/// runs raw SQL, migrations and user import.
+///
+/// ```dart
+/// final db = PlexivoClient(dataUrl, publishableKey);
+///
+/// await db.signInWithPassword(email: email, password: password);
+/// final notes = await db.from('notes').select('id, body').eq('pinned', true);
+///
+/// db.authStateChanges.listen((state) => print(state.event));
+/// ```
+///
+/// Keep one client for the life of your app. It holds the signed-in [session],
+/// sends its access token with each request, and when the Data API reports
+/// `token_expired` it refreshes the session once and retries.
 class PlexivoClient implements DataLayer, RealtimeHost {
+  /// Creates a client for the database at [apiUrl] with its [publishableKey].
+  ///
+  /// Both are on the database's **Connect** tab. Pass the secret key in place of
+  /// the publishable key only in server code.
+  ///
+  /// - [httpClient] replaces the default `http.Client`, for tests or a custom
+  ///   transport.
+  /// - [initialSession] restores a [session] saved earlier, so the user stays
+  ///   signed in across app restarts. Null starts signed out.
+  /// - [realtimeClientId] is sent as `client_id` when a realtime channel joins.
+  ///
+  /// ```dart
+  /// final saved = await loadSessionFromSecureStorage(); // may be null
+  /// final db = PlexivoClient(dataUrl, publishableKey, initialSession: saved);
+  /// db.authStateChanges.listen((s) => saveSessionToSecureStorage(s.session));
+  /// ```
   PlexivoClient(this.apiUrl, this.publishableKey, {http.Client? httpClient, Map<String, dynamic>? initialSession, this.realtimeClientId})
       : _http = httpClient ?? http.Client(),
         _session = initialSession;
 
+  /// The database's Data API URL, from the **Connect** tab.
   @override
   final String apiUrl;
 
-  /// The project key: publishable in apps; the secret key only on servers.
+  /// The project key sent with every request.
+  ///
+  /// Use the publishable key in apps. The secret key bypasses row-level security
+  /// and belongs only on servers.
   @override
   final String publishableKey;
+
+  /// An optional id sent as `client_id` when a realtime channel joins.
+  ///
+  /// Null sends none.
   final String? realtimeClientId;
   final http.Client _http;
   Map<String, dynamic>? _session;
@@ -34,24 +74,92 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   final _authChanges = StreamController<PlexivoAuthState>.broadcast();
   final _models = <String, PlexivoModel>{};
 
+  /// The signed-in session as the server returned it, or null when signed out.
+  ///
+  /// It includes `access_token` and `refresh_token`. Save it in encrypted device
+  /// storage and pass it back as `initialSession` to stay signed in.
   Map<String, dynamic>? get session => _session;
+
+  /// The trace id of the most recent response, or null if it had none.
+  ///
+  /// Quote it to support when something looks wrong.
   String? get lastTraceId => _lastTraceId;
+
+  /// Authentication events, as they happen.
+  ///
+  /// Each [PlexivoAuthState] names the event (`SIGNED_UP`, `SIGNED_IN`,
+  /// `TOKEN_REFRESHED`, `USER_UPDATED`, `PASSWORD_CHANGED`, `USER_DELETED` or
+  /// `SIGNED_OUT`) and carries the session after it. It is a broadcast stream
+  /// and does not replay the current state: read [session] for that.
+  ///
+  /// ```dart
+  /// db.authStateChanges.listen((state) {
+  ///   if (state.session == null) {
+  ///     router.go('/sign-in');
+  ///   } else {
+  ///     secureStorage.write(state.session);
+  ///   }
+  /// });
+  /// ```
   Stream<PlexivoAuthState> get authStateChanges => _authChanges.stream;
   @override
   String? get accessToken => _session?['access_token']?.toString();
+
+  /// Two-factor authentication (TOTP) for the signed-in user.
   PlexivoMfa get mfa => PlexivoMfa(this);
+
+  /// File storage for the signed-in user.
   PlexivoStorage get storage => PlexivoStorage(this);
+
+  /// Organisations, members and invitations for your app's users.
   PlexivoOrgs get orgs => PlexivoOrgs(this);
+
+  /// Calls to your Plexivo Functions.
   PlexivoFunctions get functions => PlexivoFunctions(this);
 
   // ── data ───────────────────────────────────────────────────────────────
 
-  /// A query on one table: chain filters, then await it or call a terminal method.
+  /// Starts a query on [table].
+  ///
+  /// Chain filters, columns and order, then `await` the builder to read rows, or
+  /// call a terminal method such as `first()`, `create()` or `count()`. If
+  /// [model] defined [table], its primary key, relations, hooks, scopes and soft
+  /// deletes apply. Queries go to the Data API (`POST /query/v1`), and
+  /// row-level security decides what comes back.
+  ///
+  /// ```dart
+  /// final open = await db.from('orders')
+  ///     .where('status', 'open')
+  ///     .order('created_at', 'desc')
+  ///     .limit(20);
+  ///
+  /// final order = await db.from('orders').first(42); // or RecordNotFoundException
+  /// await db.from('orders').where('id', 42).update({'status': 'paid'});
+  /// ```
+  ///
+  /// See [PlexivoQuery] for everything a query can do.
   @override
   PlexivoQuery from(String table) => PlexivoQuery(ModelContext(this, table, _models[table]));
+
+  /// Starts a query on [table]: the same as [from], in GORM's words.
   PlexivoQuery table(String table) => from(table);
 
-  /// Defines a model: relations, hooks, scopes, soft deletes and columns for migrations.
+  /// Defines the model for [table] and registers it on this client.
+  ///
+  /// From then on, every [from] on [table] uses it too. A second call for the
+  /// same table replaces the first.
+  ///
+  /// - [primaryKey]: the key column, `id` by default.
+  /// - [softDelete]: a timestamp column. Deletes set it instead of removing the
+  ///   row, and reads skip rows where it is set.
+  /// - [relations]: named [PlexivoRelation]s for `preload`, `joins`,
+  ///   `whereHas`, `withCount` and [PlexivoModel.association].
+  /// - [hooks]: [PlexivoHooks] run around reads and writes.
+  /// - [scopes]: named, reusable query pieces for [PlexivoQuery.scopes].
+  /// - [columns], [indexes], [policies], [compositeKey], [uniques], [checks] and
+  ///   [rowLevelSecurity]: the schema [PlexivoMigrator.autoMigrate] creates.
+  ///
+  /// See [PlexivoModel] for an example.
   PlexivoModel model(String table,
       {String primaryKey = 'id',
       String? softDelete,
@@ -94,15 +202,28 @@ class PlexivoClient implements DataLayer, RealtimeHost {
   Future<T> send<T>(FutureOr<Map<String, dynamic>> Function() build, FutureOr<T> Function(Map<String, dynamic>) finish, String shape) async =>
       await finish(await query(await build()));
 
-  /// Operations that commit together or not at all. Record them on `tx`
-  /// without awaiting; pass one result to the next with `.ref('id')`:
+  /// Runs operations that commit together or not at all.
+  ///
+  /// Record operations on `tx` inside [callback] **without awaiting them**. When
+  /// the callback has recorded them, they are sent in one request
+  /// (`POST /query/v1/transaction`). Pass a value from one operation to a later
+  /// one with `.ref('column')`. Returns each operation's result, in order; each
+  /// recorded operation is also a Future of its own result.
   ///
   /// ```dart
   /// final results = await db.transaction((tx) {
   ///   final author = tx.from('authors').insert({'name': 'Asha'});
   ///   tx.from('posts').insert({'title': 'Hi', 'author_id': author.ref('id')});
+  ///   tx.from('products').where('sku', 'B2').lockForUpdate().find();
   /// });
   /// ```
+  ///
+  /// If any operation fails, nothing is written and a [PlexivoException] is
+  /// thrown, with [PlexivoException.operation] naming the failed operation.
+  /// Recording an operation after awaiting one throws `transaction_already_sent`.
+  /// Transactions do not nest: `tx.transaction` throws a [StateError]. An error
+  /// thrown by [callback] is rethrown and nothing is sent. With no operations
+  /// recorded, the result is an empty list.
   @override
   Future<List<dynamic>> transaction(FutureOr<void> Function(DataLayer tx) callback) async {
     final tx = _TxLayer(this);
@@ -130,11 +251,38 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     return results;
   }
 
-  /// Calls a database function exposed with `COMMENT ON FUNCTION … IS '@expose'`.
+  /// Calls the database function [function] with named [args] and returns its result.
+  ///
+  /// Only functions exposed with `COMMENT ON FUNCTION … IS '@expose'` can be
+  /// called (`POST /rest/v1/rpc/<function>`). They run as the signed-in user, or
+  /// anonymously when signed out. The result is the function's return value
+  /// decoded from JSON: a number, string, map, list, or null.
+  ///
+  /// ```dart
+  /// final total = await db.rpc('cart_total', {'cart_id': 7});
+  /// ```
+  ///
+  /// Throws a [PlexivoException] when the call fails.
   Future<dynamic> rpc(String function, [Map<String, dynamic> args = const {}]) async =>
       (await _request('/rest/v1/rpc/${Uri.encodeComponent(function)}', method: 'POST', body: args, auth: _Auth.optional))['data'];
 
-  /// A GraphQL query or mutation: `{data, errors}`. `persisted: true` sends only the hash after the first time.
+  /// Runs a GraphQL query or mutation and returns `{data, errors}`.
+  ///
+  /// [variables] and [operationName] are sent as usual. With [persisted] true,
+  /// the client sends only the query's SHA-256 hash (an automatic persisted
+  /// query) and sends the full text only when the server has not seen it yet,
+  /// which saves bandwidth on repeated calls.
+  ///
+  /// ```dart
+  /// final r = await db.graphql(
+  ///   r'query($b: String!) { notes(where: {body: {eq: $b}}) { body } }',
+  ///   variables: {'b': 'Groceries'},
+  /// );
+  /// print(r['data']?['notes']);
+  /// ```
+  ///
+  /// GraphQL errors come back in `errors`; a failed HTTP request throws a
+  /// [PlexivoException].
   Future<Map<String, dynamic>> graphql(String query, {Map<String, dynamic> variables = const {}, String? operationName, bool persisted = false}) async {
     final base = <String, dynamic>{'variables': variables, if (operationName != null) 'operationName': operationName};
     Future<Map<String, dynamic>> post(Map<String, dynamic> body) => _request('/graphql/v1', method: 'POST', body: body, auth: _Auth.optional);
@@ -150,7 +298,23 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     return first;
   }
 
-  /// A live query: the answer now, and again whenever a row it reads changes. Call the returned function to stop.
+  /// Runs a live GraphQL query: [onResult] gets the answer now, and again whenever a row it reads changes.
+  ///
+  /// It runs over the realtime `graphql` channel, and each subscriber sees only
+  /// the rows their row-level security allows. Returns a function that stops the
+  /// subscription and closes its channel.
+  ///
+  /// ```dart
+  /// final stop = await db.graphqlSubscribe(
+  ///   'subscription { notes { body } }',
+  ///   (result) => print(result['data']?['notes']),
+  /// );
+  /// // Later:
+  /// await stop();
+  /// ```
+  ///
+  /// If the server refuses the subscription, [onResult] gets a map with
+  /// `errors`. The returned Future completes once the channel has joined.
   Future<Future<void> Function()> graphqlSubscribe(String query, void Function(Map<String, dynamic> result) onResult,
       {Map<String, dynamic> variables = const {}}) async {
     final id = 'q${Random().nextInt(1 << 31).toRadixString(36)}';
@@ -176,43 +340,134 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     };
   }
 
-  /// The live Data API: every exposed table (columns, keys, relations) and function.
+  /// Describes the live Data API: every exposed table (columns, keys, relations) and function.
+  ///
+  /// Reads `GET /meta/api`. Useful for tooling and for checking that a table is
+  /// exposed.
   Future<Map<String, dynamic>> getApi() => _request('/meta/api', auth: _Auth.optional);
 
-  /// Realtime over a WebSocket: `changes:<table>` (with `filter`), `room:<name>` (with `presence`), or the starter `items`.
+  /// Creates a realtime channel on [topic]; call `subscribe()` to connect.
+  ///
+  /// Topics:
+  /// - `changes:<table>`: row changes you may read. [filter] narrows them in
+  ///   PostgREST form, such as `status=eq.open`.
+  /// - `room:<name>`: broadcast and presence for everyone who joins; [presence]
+  ///   is what this client shares about itself. `room:private:<name>` is for
+  ///   signed-in users only.
+  /// - `items` (the default) or another table name: the per-user starter channel.
+  ///
+  /// ```dart
+  /// final feed = db.channel('changes:orders', 'status=eq.open')..subscribe();
+  /// feed.changes.listen((c) => print('${c.type} ${c.record}'));
+  ///
+  /// final room = db.channel('room:lobby', null, {'name': 'Asha'})..subscribe();
+  /// await room.ready();
+  /// room.sendBroadcast('wave', {'from': 'Asha'});
+  /// ```
   PlexivoRealtimeChannel channel([String topic = 'items', String? filter, Map<String, dynamic>? presence]) =>
       PlexivoRealtimeChannel(this, topic, filter: filter, presenceMeta: presence, clientId: realtimeClientId);
 
   // ── server: raw SQL and migrations (secret key) ────────────────────────
 
+  /// Raw SQL and migrations, for servers holding the secret key.
+  ///
+  /// **Server only.** With the publishable key the platform refuses every call.
+  /// Never ship the secret key in a Flutter app.
   late final PlexivoSql sql = PlexivoSql((path, body) => _request(path, method: 'POST', body: body));
+
+  /// Runs [query] with `$1`, `$2` … [params] and returns its rows.
+  ///
+  /// **Server only, with the secret key.** The same as `sql.raw`; see
+  /// [PlexivoSql.raw].
+  ///
+  /// ```dart
+  /// final big = await server.raw(r'select * from orders where total > $1', [100]);
+  /// ```
   Future<List<Map<String, dynamic>>> raw(String query, [List<Object?> params = const []]) => sql.raw(query, params);
+
+  /// Runs a statement and returns its command tag and affected row count.
+  ///
+  /// **Server only, with the secret key.** The same as `sql.exec`; see
+  /// [PlexivoSql.exec].
   Future<({String? command, int rowCount})> exec(String query, [List<Object?> params = const []]) => sql.exec(query, params);
+
+  /// Schema inspection and changes, like GORM's Migrator.
+  ///
+  /// **Server only, with the secret key.** See [PlexivoMigrator].
   PlexivoMigrator get migrator => sql.migrator;
+
+  /// Applies the [migrations] not yet applied, in order, and returns their ids.
+  ///
+  /// **Server only, with the secret key.** See [PlexivoSql.migrate].
   Future<List<String>> migrate(List<PlexivoMigration> migrations) => sql.migrate(migrations);
+
+  /// Undoes the newest [steps] applied migrations and returns their ids.
+  ///
+  /// **Server only, with the secret key.** See [PlexivoSql.rollback].
   Future<List<String>> rollback(List<PlexivoMigration> migrations, {int steps = 1}) => sql.rollback(migrations, steps: steps);
 
   // ── auth ───────────────────────────────────────────────────────────────
 
+  /// Creates an account with [email] and [password], and signs it in.
+  ///
+  /// Calls `POST /auth/signup`, stores the returned session in [session], emits
+  /// `SIGNED_UP` on [authStateChanges] and returns the session. Follow your
+  /// project's email-verification policy.
+  ///
+  /// ```dart
+  /// await db.signUp(email: 'asha@example.com', password: 'a long password');
+  /// print(db.session?['user']);
+  /// ```
+  ///
+  /// Throws a [PlexivoException] if the account cannot be created, for example
+  /// when the email is taken.
   Future<Map<String, dynamic>> signUp({required String email, required String password}) =>
       _authenticate('/auth/signup', {'email': email, 'password': password});
 
+  /// Signs in with [email] and [password], and returns the new session.
+  ///
+  /// If the account has two-factor authentication on, pass the current code from
+  /// the authenticator app as [mfaCode]. Stores the session in [session] and
+  /// emits `SIGNED_IN`.
+  ///
+  /// ```dart
+  /// try {
+  ///   await db.signInWithPassword(email: email, password: password);
+  /// } on PlexivoException catch (e) {
+  ///   showError(e.message);
+  /// }
+  /// ```
   Future<Map<String, dynamic>> signInWithPassword({required String email, required String password, String? mfaCode}) =>
       _authenticate('/auth/login', {'email': email, 'password': password, if (mfaCode != null) 'mfa_code': mfaCode});
 
-  /// A guest session, when the project allows guests.
+  /// Starts a guest session, when the project allows guests.
+  ///
+  /// The guest can read and write like any user. Call [linkEmail] later to turn
+  /// it into a full account that keeps its id and rows.
   Future<Map<String, dynamic>> signInAnonymously() => _authenticate('/auth/anonymous', {});
 
-  /// The guest becomes an account, keeping its id and rows.
+  /// Turns the signed-in guest into an account with [email] and [password].
+  ///
+  /// The user keeps its id and rows. Updates [session] and emits `USER_UPDATED`.
+  /// Throws a [StateError] when no one is signed in.
   Future<Map<String, dynamic>> linkEmail({required String email, required String password}) async {
     final s = await _request('/auth/upgrade', method: 'POST', body: {'email': email, 'password': password}, auth: _Auth.required);
     _setSession(s, 'USER_UPDATED');
     return s;
   }
 
-  /// Sign in with Google, GitHub or Microsoft (OAuth with PKCE): open the
-  /// returned URL in a browser, then pass the `code` from the redirect to
-  /// [exchangeCodeForSession]. The verifier is kept on this client.
+  /// Starts sign-in with an identity [provider] such as `google`, `github` or `microsoft`.
+  ///
+  /// Open the returned URL in a browser. After sign-in the browser returns to
+  /// [redirectTo] with a `code`; pass it to [exchangeCodeForSession]. The flow
+  /// uses PKCE: the verifier is kept on this client (see [oauthCodeVerifier]).
+  ///
+  /// ```dart
+  /// final url = db.getOAuthSignInUrl(provider: 'github', redirectTo: 'myapp://auth');
+  /// await launchUrl(url);
+  /// // When the app opens myapp://auth?code=…
+  /// await db.exchangeCodeForSession(code);
+  /// ```
   Uri getOAuthSignInUrl({required String provider, required String redirectTo}) {
     final random = Random.secure();
     final verifier = base64Url.encode(List<int>.generate(32, (_) => random.nextInt(256))).replaceAll('=', '');
@@ -226,9 +481,17 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     });
   }
 
-  /// The PKCE verifier of the last [getOAuthSignInUrl], to keep if the app may restart mid sign-in.
+  /// The PKCE verifier of the last [getOAuthSignInUrl], or null if there is none.
+  ///
+  /// Save it if the app may restart mid sign-in, then pass it to
+  /// [exchangeCodeForSession] as `codeVerifier`.
   String? get oauthCodeVerifier => _pkceVerifier;
 
+  /// Finishes identity-provider sign-in with the [code] from the redirect.
+  ///
+  /// Uses [codeVerifier], or the one kept from [getOAuthSignInUrl]. Stores the
+  /// session, emits `SIGNED_IN` and returns it. Throws a [StateError] when there
+  /// is no verifier, and a [PlexivoException] when the code is refused.
   Future<Map<String, dynamic>> exchangeCodeForSession(String code, {String? codeVerifier}) async {
     final verifier = codeVerifier ?? _pkceVerifier;
     if (verifier == null) throw StateError('The PKCE code verifier from getOAuthSignInUrl is required');
@@ -238,46 +501,87 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     return s;
   }
 
+  /// The sign-in methods this project offers, as the server describes them.
   Future<Map<String, dynamic>> getAuthProviders() => _request('/auth/providers');
 
+  /// Emails a password-reset code to [email].
+  ///
+  /// Finish with [verifyPasswordRecovery].
   Future<void> resetPasswordForEmail(String email) async {
     await _request('/auth/password/recovery', method: 'POST', body: {'email': email});
   }
 
+  /// Sets [newPassword] for [email] using the [code] from the reset email.
+  ///
+  /// It does not sign in: call [signInWithPassword] afterwards.
   Future<void> verifyPasswordRecovery({required String email, required String code, required String newPassword}) async {
     await _request('/auth/password/reset', method: 'POST', body: {'email': email, 'code': code, 'new_password': newPassword});
   }
 
+  /// Emails a one-time sign-in code to [email].
+  ///
+  /// Finish with [verifyOtp].
   Future<void> signInWithOtp(String email) async {
     await _request('/auth/passwordless', method: 'POST', body: {'email': email});
   }
 
+  /// Signs in with the emailed one-time code [token], and returns the session.
+  ///
+  /// Pass [mfaCode] if the account has two-factor authentication on. Emits
+  /// `SIGNED_IN`.
   Future<Map<String, dynamic>> verifyOtp({required String email, required String token, String? mfaCode}) =>
       _authenticate('/auth/passwordless/verify', {'email': email, 'code': token, if (mfaCode != null) 'mfa_code': mfaCode});
 
+  /// Exchanges a refresh token for a fresh session.
+  ///
+  /// Uses [refreshToken], or the current session's. Emits `TOKEN_REFRESHED`. The
+  /// client already does this on its own when an access token expires.
   Future<Map<String, dynamic>> refreshSession([String? refreshToken]) =>
       _authenticate('/auth/refresh', {'refresh_token': refreshToken ?? _session?['refresh_token']});
 
+  /// The signed-in user, fresh from the server.
+  ///
+  /// Throws a [StateError] when no one is signed in.
   Future<Map<String, dynamic>> getUser() async => (await _request('/auth/user', auth: _Auth.required))['user'] as Map<String, dynamic>;
 
   /// The user's signed-in devices; `current` marks this one.
+  ///
+  /// Throws a [StateError] when no one is signed in.
   Future<List<Map<String, dynamic>>> listSessions() async =>
       ((await _request('/auth/sessions', auth: _Auth.required))['sessions'] as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
+  /// Signs out the device with [sessionId], from [listSessions].
   Future<void> revokeSession(String sessionId) async {
     await _request('/auth/sessions/${Uri.encodeComponent(sessionId)}', method: 'DELETE', auth: _Auth.required);
   }
 
+  /// Changes the signed-in user's password.
+  ///
+  /// Needs [currentPassword]. Afterwards this client is signed out ([session]
+  /// becomes null and `PASSWORD_CHANGED` is emitted), so sign in again with
+  /// [newPassword].
   Future<void> updatePassword({required String currentPassword, required String newPassword}) async {
     await _request('/auth/password', method: 'POST', body: {'current_password': currentPassword, 'new_password': newPassword}, auth: _Auth.required);
     _setSession(null, 'PASSWORD_CHANGED');
   }
 
+  /// Deletes the signed-in user's account, confirmed with their [password].
+  ///
+  /// Clears [session] and emits `USER_DELETED`. This cannot be undone.
   Future<void> deleteUser({required String password}) async {
     await _request('/auth/user', method: 'DELETE', body: {'password': password}, auth: _Auth.required);
     _setSession(null, 'USER_DELETED');
   }
 
+  /// Signs out this device, or every device with [allSessions].
+  ///
+  /// The local session is cleared and `SIGNED_OUT` emitted even if the request
+  /// fails. Throws a [StateError] when no one is signed in.
+  ///
+  /// ```dart
+  /// await db.signOut();                  // this device
+  /// await db.signOut(allSessions: true); // every device
+  /// ```
   Future<void> signOut({bool allSessions = false}) async {
     try {
       await _request('/auth/logout',
@@ -287,10 +591,14 @@ class PlexivoClient implements DataLayer, RealtimeHost {
     }
   }
 
-  /// Server-only, with the secret key: users from a migrated Supabase database, with their passwords.
+  /// Imports the users of a migrated Supabase database, with their passwords.
+  ///
+  /// **Server only, with the secret key.** Returns the import summary.
   Future<Map<String, dynamic>> importUsersFromSupabase() => _request('/auth/admin/import/supabase', method: 'POST', body: {});
 
-  /// Server-only, with the secret key: users from an export, with bcrypt hashes.
+  /// Imports [users] from an export, with their bcrypt password hashes.
+  ///
+  /// **Server only, with the secret key.** Returns the import summary.
   Future<Map<String, dynamic>> importUsers(List<Map<String, dynamic>> users) => _request('/auth/admin/import', method: 'POST', body: {'users': users});
 
   Future<Map<String, dynamic>> _authenticate(String path, Map<String, dynamic> body) async {
@@ -486,45 +794,121 @@ class _TxLayer implements DataLayer {
   }
 }
 
+/// One authentication event from [PlexivoClient.authStateChanges].
 class PlexivoAuthState {
+  /// Creates an event named [event] with the [session] after it.
   PlexivoAuthState(this.event, this.session);
+
+  /// What happened.
+  ///
+  /// One of `SIGNED_UP`, `SIGNED_IN`, `TOKEN_REFRESHED`, `USER_UPDATED`,
+  /// `PASSWORD_CHANGED`, `USER_DELETED` or `SIGNED_OUT`.
   final String event;
+
+  /// The session after the event, or null when signed out.
   final Map<String, dynamic>? session;
 }
 
 /// Organisations for your app's own users: roles, members and invitations.
+///
+/// Every call needs a signed-in user and throws a [StateError] otherwise.
+///
+/// ```dart
+/// final team = await db.orgs.create(name: 'Design team');
+/// final invite = await db.orgs.invite(team['id'] as String, email: 'bob@example.com');
+///
+/// // Bob, signed in on his own device:
+/// await bobDb.orgs.acceptInvitation(invite['token'] as String);
+/// ```
 class PlexivoOrgs {
+  /// Creates the organisations API for a client; use [PlexivoClient.orgs].
   PlexivoOrgs(this._c);
   final PlexivoClient _c;
   String _o(String id) => '/auth/orgs/${Uri.encodeComponent(id)}';
   List<Map<String, dynamic>> _list(Map<String, dynamic> r) => (r['data'] as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
+  /// The organisations the signed-in user belongs to.
   Future<List<Map<String, dynamic>>> list() async => _list(await _c._request('/auth/orgs', auth: _Auth.required));
+
+  /// Creates an organisation called [name], with the signed-in user as owner.
+  ///
+  /// [slug] and [metadata] are optional. Returns the organisation, including its
+  /// `id` and the caller's `role`.
   Future<Map<String, dynamic>> create({required String name, String? slug, Map<String, dynamic>? metadata}) async =>
       Map<String, dynamic>.from((await _c._request('/auth/orgs',
           method: 'POST',
           body: {'name': name, if (slug != null) 'slug': slug, if (metadata != null) 'metadata': metadata},
           auth: _Auth.required))['data'] as Map);
+
+  /// Deletes the organisation [orgId].
   Future<void> delete(String orgId) async => _c._request(_o(orgId), method: 'DELETE', auth: _Auth.required);
+
+  /// The members of [orgId], with their roles.
   Future<List<Map<String, dynamic>>> members(String orgId) async => _list(await _c._request('${_o(orgId)}/members', auth: _Auth.required));
+
+  /// Gives member [userId] of [orgId] a new [role].
   Future<void> setRole(String orgId, String userId, String role) async =>
       _c._request('${_o(orgId)}/members/${Uri.encodeComponent(userId)}', method: 'PATCH', body: {'role': role}, auth: _Auth.required);
+
+  /// Removes member [userId] from [orgId].
   Future<void> removeMember(String orgId, String userId) async =>
       _c._request('${_o(orgId)}/members/${Uri.encodeComponent(userId)}', method: 'DELETE', auth: _Auth.required);
+
+  /// The open invitations of [orgId].
   Future<List<Map<String, dynamic>>> invitations(String orgId) async => _list(await _c._request('${_o(orgId)}/invitations', auth: _Auth.required));
+
+  /// Invites [email] to [orgId] with [role], `member` by default.
+  ///
+  /// Returns the invitation, including the `token` the invitee passes to
+  /// [acceptInvitation].
   Future<Map<String, dynamic>> invite(String orgId, {required String email, String role = 'member'}) async => Map<String, dynamic>.from(
       (await _c._request('${_o(orgId)}/invitations', method: 'POST', body: {'email': email, 'role': role}, auth: _Auth.required))['data'] as Map);
+
+  /// Withdraws invitation [invitationId] of [orgId].
   Future<void> revokeInvitation(String orgId, String invitationId) async =>
       _c._request('${_o(orgId)}/invitations/${Uri.encodeComponent(invitationId)}', method: 'DELETE', auth: _Auth.required);
+
+  /// Joins an organisation with an invitation [token]; returns the membership.
   Future<Map<String, dynamic>> acceptInvitation(String token) async =>
       Map<String, dynamic>.from((await _c._request('/auth/invitations/accept', method: 'POST', body: {'token': token}, auth: _Auth.required))['data'] as Map);
 }
 
 /// Plexivo Functions: your server-side code beside the data.
+///
+/// ```dart
+/// final res = await db.functions.invoke('send-receipt', body: {'orderId': 42});
+/// print(res.status); // 200
+/// print(res.data);   // decoded JSON, or the body as text
+/// ```
 class PlexivoFunctions {
+  /// Creates the functions API for a client; use [PlexivoClient.functions].
   PlexivoFunctions(this._c);
   final PlexivoClient _c;
 
+  /// Calls the function [name] and returns its `data`, `status` and `headers`.
+  ///
+  /// The request goes to `<apiUrl>/functions/v1/<name>/<path>?<query>`.
+  ///
+  /// - [body]: a `List<int>` is sent as bytes, a `String` as is, and anything
+  ///   else as JSON (with `content-type: application/json` unless [headers] set
+  ///   one). Null sends no body.
+  /// - [method]: `POST` by default.
+  /// - [headers]: extra request headers. When a user is signed in, their access
+  ///   token is sent as `authorization`.
+  /// - [path]: a sub-path; each segment is URL-encoded.
+  /// - [query]: query parameters; null values are left out, others are sent as
+  ///   text.
+  ///
+  /// `data` is decoded JSON when the response is `application/json`, otherwise
+  /// the body as text.
+  ///
+  /// ```dart
+  /// final res = await db.functions.invoke('reports',
+  ///     method: 'GET', path: 'monthly/2026-10', query: {'format': 'json'});
+  /// ```
+  ///
+  /// Throws an [ArgumentError] for an empty name, `.` or `..`, or a [path] with
+  /// `.` or `..` segments, and a [PlexivoException] for a response outside 2xx.
   Future<({dynamic data, int status, Map<String, String> headers})> invoke(String name,
       {Object? body, String method = 'POST', Map<String, String> headers = const {}, String path = '', Map<String, Object?> query = const {}}) async {
     if (name.isEmpty || name == '.' || name == '..') throw ArgumentError.value(name, 'name', 'Invalid function name');
@@ -556,30 +940,56 @@ class PlexivoFunctions {
   }
 }
 
+/// Two-factor authentication with an authenticator app (TOTP).
+///
+/// Every call needs a signed-in user and throws a [StateError] otherwise.
 class PlexivoMfa {
+  /// Creates the two-factor API for a client; use [PlexivoClient.mfa].
   PlexivoMfa(this._client);
   final PlexivoClient _client;
 
+  /// Starts two-factor enrolment and returns the new TOTP factor.
+  ///
+  /// The factor carries what an authenticator app needs to add the account.
+  /// Confirm it with [verify].
   Future<Map<String, dynamic>> enroll() async =>
       (await _client._request('/auth/mfa/totp/enroll', method: 'POST', body: {}, auth: _Auth.required))['factor'] as Map<String, dynamic>;
 
+  /// Confirms enrolment with a [code] from the authenticator app; returns the factor.
   Future<Map<String, dynamic>> verify(String code) async =>
       (await _client._request('/auth/mfa/totp/verify', method: 'POST', body: {'code': code}, auth: _Auth.required))['factor'] as Map<String, dynamic>;
 
+  /// Turns two-factor authentication off, confirmed with the user's [password].
   Future<void> unenroll({required String password}) async {
     await _client._request('/auth/mfa/totp', method: 'DELETE', body: {'password': password}, auth: _Auth.required);
   }
 }
 
+/// File storage for the signed-in user.
+///
+/// Bytes go straight to storage through short-lived signed URLs. Every call
+/// needs a signed-in user and throws a [StateError] otherwise.
+///
+/// ```dart
+/// final object = await db.storage.upload('avatars/me.png', pngBytes, contentType: 'image/png');
+/// final file = await db.storage.download(object['id'] as String);
+/// print('${file.bytes.length} bytes of ${file.contentType}');
+/// ```
 class PlexivoStorage {
+  /// Creates the storage API for a client; use [PlexivoClient.storage].
   PlexivoStorage(this._client);
   final PlexivoClient _client;
 
+  /// The signed-in user's stored objects.
   Future<List<Map<String, dynamic>>> list() async {
     final response = await _client._request('/storage/v1/objects', auth: _Auth.required);
     return (response['data'] as List<dynamic>).map((object) => Map<String, dynamic>.from(object as Map)).toList();
   }
 
+  /// Uploads [bytes] to [path] with [contentType], and returns the stored object.
+  ///
+  /// The object includes its `id`, for [download], [createSignedDownloadUrl]
+  /// and [remove]. Throws a [PlexivoException] if the upload is refused.
   Future<Map<String, dynamic>> upload(String path, List<int> bytes, {required String contentType}) async {
     final signed = (await _client._request('/storage/v1/objects/sign-upload',
         method: 'POST', body: {'path': path, 'content_type': contentType, 'size': bytes.length}, auth: _Auth.required))['data'] as Map<String, dynamic>;
@@ -590,22 +1000,33 @@ class PlexivoStorage {
     return Map<String, dynamic>.from((jsonDecode(response.body) as Map<String, dynamic>)['data'] as Map);
   }
 
+  /// A short-lived download link for object [id], as `signed_url`.
+  ///
+  /// Share it, or hand it to an image widget, without sending the user's token.
   Future<Map<String, dynamic>> createSignedDownloadUrl(String id) async => Map<String, dynamic>.from(
       (await _client._request('/storage/v1/objects/${Uri.encodeComponent(id)}/sign-download', method: 'POST', auth: _Auth.required))['data'] as Map);
 
+  /// Downloads object [id]: its bytes and content type.
   Future<PlexivoStorageDownload> download(String id) async {
     final signed = await createSignedDownloadUrl(id);
     final response = await _client._signedRequest(http.Request('GET', Uri.parse(signed['signed_url'] as String)));
     return PlexivoStorageDownload(response.bodyBytes, response.headers['content-type']);
   }
 
+  /// Deletes object [id].
   Future<void> remove(String id) async {
     await _client._request('/storage/v1/objects/${Uri.encodeComponent(id)}', method: 'DELETE', auth: _Auth.required);
   }
 }
 
+/// A downloaded file: its [bytes] and [contentType].
 class PlexivoStorageDownload {
+  /// Wraps downloaded [bytes] and their [contentType].
   PlexivoStorageDownload(this.bytes, this.contentType);
+
+  /// The file's contents.
   final List<int> bytes;
+
+  /// The file's media type, such as `image/png`; null when the server sent none.
   final String? contentType;
 }

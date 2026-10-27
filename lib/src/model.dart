@@ -3,41 +3,112 @@ import 'dart:async';
 import 'query.dart';
 import 'result.dart';
 
-/// How two tables relate.
+/// How two tables relate, for `preload`, `joins`, `whereHas`, `withCount` and association mode.
+///
+/// Declare relations on a model with [PlexivoClient.model]. Without a
+/// declared relation, a query can still name a related table directly, with an
+/// optional `!constraint` hint, and the Data API follows the foreign key.
 class PlexivoRelation {
   const PlexivoRelation._(this.kind, this.table, {this.foreignKey, this.references, this.constraint, this.through, this.otherKey, this.throughConstraint});
 
   /// This table holds the foreign key: `posts.author_id → authors.id`.
+  ///
+  /// [foreignKey] is the column on this table. [references] is the column it
+  /// points to on [table], its primary key by default. [constraint] names the
+  /// foreign-key constraint when more than one links the two tables.
   const PlexivoRelation.belongsTo(String table, {String? foreignKey, String? references, String? constraint})
       : this._('belongsTo', table, foreignKey: foreignKey, references: references, constraint: constraint);
 
-  /// The other table holds the foreign key, one row per row here.
+  /// The other table holds the foreign key, one row per row here: `users.id ← profiles.user_id`.
+  ///
+  /// [foreignKey] is the column on [table]. [references] is the column it points
+  /// to on this table, the primary key by default. [constraint] names the
+  /// foreign-key constraint when more than one links the two tables. Preloaded,
+  /// it is one map, or null.
   const PlexivoRelation.hasOne(String table, {String? foreignKey, String? references, String? constraint})
       : this._('hasOne', table, foreignKey: foreignKey, references: references, constraint: constraint);
 
-  /// The other table holds the foreign key, many rows per row here.
+  /// The other table holds the foreign key, many rows per row here: `posts.id ← comments.post_id`.
+  ///
+  /// [foreignKey] is the column on [table]. [references] is the column it points
+  /// to on this table, the primary key by default. [constraint] names the
+  /// foreign-key constraint when more than one links the two tables. Preloaded,
+  /// it is a list.
   const PlexivoRelation.hasMany(String table, {String? foreignKey, String? references, String? constraint})
       : this._('hasMany', table, foreignKey: foreignKey, references: references, constraint: constraint);
 
   /// Related through a link table: `posts ⇄ post_tags ⇄ tags`.
+  ///
+  /// [through] is the link table. [foreignKey] is its column pointing to this
+  /// table, and [otherKey] its column pointing to [table]. [constraint] and
+  /// [throughConstraint] name the foreign-key constraints (link table to
+  /// [table], and link table to this table) when more than one exists.
+  /// Preloaded, it is a list of [table] rows.
+  ///
+  /// ```dart
+  /// 'tags': const PlexivoRelation.manyToMany('tags',
+  ///     through: 'post_tags', foreignKey: 'post_id', otherKey: 'tag_id'),
+  /// ```
   const PlexivoRelation.manyToMany(String table,
       {required String through, required String foreignKey, required String otherKey, String? constraint, String? throughConstraint})
       : this._('manyToMany', table, through: through, foreignKey: foreignKey, otherKey: otherKey, constraint: constraint, throughConstraint: throughConstraint);
 
+  /// The kind: `belongsTo`, `hasOne`, `hasMany` or `manyToMany`.
   final String kind;
+
+  /// The related table.
   final String table;
+
+  /// The foreign-key column; see each constructor for which table holds it.
   final String? foreignKey;
+
+  /// The column the foreign key points to, or null for the primary key.
   final String? references;
+
+  /// The foreign-key constraint to follow, or null to let the Data API find it.
   final String? constraint;
+
+  /// For many-to-many, the link table; otherwise null.
   final String? through;
+
+  /// For many-to-many, the link table's column pointing to [table]; otherwise null.
   final String? otherKey;
+
+  /// For many-to-many, the constraint between the link table and this table; otherwise null.
   final String? throughConstraint;
 }
 
+/// A lifecycle hook: it gets a row and may return a changed one.
+///
+/// Return null (or nothing) to keep the row as it is. Throw to stop the
+/// operation. Hooks may be async.
 typedef RowHook = FutureOr<Map<String, dynamic>?> Function(Map<String, dynamic> row);
 
-/// Lifecycle hooks, run in GORM's order. A before-hook may return a changed row; throwing stops the write.
+/// Lifecycle hooks, run in GORM's order around a model's reads and writes.
+///
+/// - Create (`create`, `insert`, `save` without a key): [beforeSave],
+///   [beforeCreate], the insert, then [afterCreate], [afterSave].
+/// - Update (`update`, `updateById`): [beforeSave], [beforeUpdate] on the
+///   values being set, the update, then [afterUpdate], [afterSave] on each
+///   updated row. `increment` runs only the after-hooks.
+/// - Upsert (`upsert`, `save` with a key): [beforeSave], then [afterSave].
+/// - Delete: [beforeDelete], the delete, then [afterDelete] on each deleted
+///   row. [beforeDelete] gets the query's structured select operation (its
+///   filter), because rows are not read first.
+/// - Reads: [afterFind] on each row read.
+///
+/// A before-hook may return a changed row; throwing stops the write. The
+/// return values of after-write hooks are ignored; [afterFind] may return a
+/// changed row. Hooks run in your app, not in the database.
+///
+/// ```dart
+/// hooks: PlexivoHooks(
+///   beforeCreate: (row) => {...row, 'slug': slugify(row['title'] as String)},
+///   afterFind: (row) => {...row, 'title': (row['title'] as String).trim()},
+/// ),
+/// ```
 class PlexivoHooks {
+  /// Creates a set of hooks; leave out the ones you don't need.
   const PlexivoHooks(
       {this.beforeSave,
       this.beforeCreate,
@@ -48,20 +119,65 @@ class PlexivoHooks {
       this.beforeDelete,
       this.afterDelete,
       this.afterFind});
+
+  /// Runs before every create, update and upsert.
   final RowHook? beforeSave;
+
+  /// Runs before an insert, after [beforeSave].
   final RowHook? beforeCreate;
+
+  /// Runs on each inserted row.
   final RowHook? afterCreate;
+
+  /// Runs on the values of an update, after [beforeSave].
   final RowHook? beforeUpdate;
+
+  /// Runs on each updated row.
   final RowHook? afterUpdate;
+
+  /// Runs after every create, update and upsert, on each written row.
   final RowHook? afterSave;
+
+  /// Runs before a delete, with the query's structured select operation.
   final RowHook? beforeDelete;
+
+  /// Runs on each deleted row.
   final RowHook? afterDelete;
+
+  /// Runs on each row read, and may return a changed row.
   final RowHook? afterFind;
 }
 
-/// A table described once: primary key, relations, hooks, scopes, soft
-/// deletes, and (for migrations) columns, indexes and policies.
+/// A table described once: primary key, relations, hooks, scopes, soft deletes and schema.
+///
+/// Define one with [PlexivoClient.model]; from then on every query on the
+/// table uses it.
+///
+/// ```dart
+/// final posts = db.model('posts',
+///     softDelete: 'deleted_at',
+///     relations: {
+///       'author': const PlexivoRelation.belongsTo('authors', foreignKey: 'author_id'),
+///       'comments': const PlexivoRelation.hasMany('comments', foreignKey: 'post_id'),
+///     },
+///     hooks: PlexivoHooks(beforeCreate: (row) => {...row, 'slug': slugify(row['title'] as String)}),
+///     scopes: {'popular': (q) => q.where('likes', '>=', 10)},
+///     columns: {
+///       'id': {'type': 'bigint', 'identity': true, 'primaryKey': true},
+///       'title': 'text not null',
+///       'author_id': {'type': 'bigint', 'references': 'authors(id)', 'onDelete': 'cascade'},
+///       'deleted_at': 'timestamptz',
+///     });
+///
+/// final popular = await posts.query().scopes(['popular']).preload('author').withCount('comments');
+/// await posts.where('id', 7).delete(); // sets deleted_at
+/// ```
 class PlexivoModel {
+  /// Creates a model for [table].
+  ///
+  /// Prefer [PlexivoClient.model], which also registers the model so that
+  /// `from(table)` uses it. The named parameters set the fields of the same
+  /// names.
   PlexivoModel(this._layer, this.table,
       {this.primaryKey = 'id',
       this.softDelete,
@@ -77,65 +193,167 @@ class PlexivoModel {
       this.rowLevelSecurity});
 
   final DataLayer _layer;
+
+  /// The table this model describes, optionally as `schema.table`.
   final String table;
+
+  /// The primary-key column, `id` by default.
   final String primaryKey;
+
+  /// The soft-delete timestamp column, or null for hard deletes.
+  ///
+  /// When set, deletes set this column to the current time, and reads skip rows
+  /// where it is set. Use `unscoped()`, `onlyTrashed()`, `restore()` and
+  /// `forceDelete()` on a query to work with deleted rows.
   final String? softDelete;
+
+  /// Named relations to other tables.
   final Map<String, PlexivoRelation> relations;
+
+  /// Lifecycle hooks run around this model's reads and writes.
   final PlexivoHooks hooks;
+
+  /// Named, reusable query pieces, applied with [PlexivoQuery.scopes].
   final Map<String, PlexivoQuery Function(PlexivoQuery)> scopes;
 
-  /// For migrations: `{'title': 'text not null'}` or `{'title': {'type': 'text', 'notNull': true}}`.
+  /// Column definitions for migrations, or null if this model does not migrate.
+  ///
+  /// Each value is SQL (`'text not null'`) or a map; see [columnSql] for the
+  /// keys. [PlexivoMigrator.autoMigrate] needs this.
   final Map<String, Object>? columns;
+
+  /// Indexes for migrations.
+  ///
+  /// Each is `{'columns': ['a', 'b'], 'unique': true, 'name': …, 'using': 'gin', 'where': …}`;
+  /// only `columns` is required.
   final List<Map<String, dynamic>> indexes;
+
+  /// Row-level security policies created with a new table.
+  ///
+  /// Each is `{'name': …, 'for': 'select', 'to': 'authenticated', 'using': …, 'check': …}`,
+  /// with `for` one of `all`, `select`, `insert`, `update` or `delete`, and
+  /// `as` `permissive` (the default) or `restrictive`.
   final List<Map<String, dynamic>> policies;
+
+  /// The primary-key columns when the key spans several; otherwise null.
   final List<String>? compositeKey;
+
+  /// Unique constraints: each a column name, or a list of column names.
   final List<Object> uniques;
+
+  /// Check constraints, as SQL expressions.
   final List<String> checks;
+
+  /// Whether a new table gets row-level security.
+  ///
+  /// Null turns it on when [policies] is not empty.
   final bool? rowLevelSecurity;
 
+  /// Starts a query on this model's table.
   PlexivoQuery query() => _layer.from(table);
 
   // GORM-style shortcuts.
+  /// Starts a query with a filter; see [PlexivoQuery.where].
   PlexivoQuery where(Object column, [Object? op = _gap, Object? value = _gap]) => identical(op, _gap)
       ? query().where(column)
       : identical(value, _gap)
           ? query().where(column, op)
           : query().where(column, op, value);
+
+  /// Starts a query that also returns related rows; see [PlexivoQuery.preload].
   PlexivoQuery preload(String relation, [Function? callback]) => query().preload(relation, callback);
+
+  /// Starts a query for rows with a matching related row; see [PlexivoQuery.whereHas].
   PlexivoQuery whereHas(String relation, [Function? callback]) => query().whereHas(relation, callback);
+
+  /// Starts a query returning [columns]; see [PlexivoQuery.select].
   PlexivoQuery select([Object? columns]) => query().select(columns);
+
+  /// Starts a query in this order; see [PlexivoQuery.order].
   PlexivoQuery order(Object column, [Object? dir]) => query().order(column, dir);
+
+  /// The first row, or the row with primary key [id]; see [PlexivoQuery.first].
   Future<Map<String, dynamic>> first([Object? id]) => query().first(id);
+
+  /// The last row by primary key; see [PlexivoQuery.last].
   Future<Map<String, dynamic>> last() => query().last();
+
+  /// The first row, or null when there is none; see [PlexivoQuery.firstOrNull].
   Future<Map<String, dynamic>?> firstOrNull([Object? id]) => query().firstOrNull(id);
+
+  /// Rows, or the rows with primary keys [ids]; see [PlexivoQuery.find].
   Future<PlexivoResult> find([List<Object?>? ids]) => query().find(ids);
+
+  /// The number of rows; see [PlexivoQuery.count].
   Future<int> count() => query().count();
+
+  /// Inserts one row and returns it; see [PlexivoQuery.create].
   Future<Map<String, dynamic>> create(Map<String, dynamic> values) => query().create(values);
+
+  /// Inserts several rows and returns them; see [PlexivoQuery.createMany].
   Future<PlexivoResult> createMany(List<Map<String, dynamic>> values) => query().createMany(values);
+
+  /// Inserts [row], or updates it when it has a primary key; see [PlexivoQuery.save].
   Future<Map<String, dynamic>> save(Map<String, dynamic> row) => query().save(row);
+
+  /// Inserts, or updates on conflict; see [PlexivoQuery.upsert].
   PlexivoQuery upsert(Object values, {Object? onConflict, List<String>? update, bool ignore = false}) =>
       query().upsert(values, onConflict: onConflict, update: update, ignore: ignore);
+
+  /// Finds the row matching [attributes], or creates it; see [PlexivoQuery.firstOrCreate].
   Future<Map<String, dynamic>> firstOrCreate(Map<String, dynamic> attributes, [Map<String, dynamic> defaults = const {}]) =>
       query().firstOrCreate(attributes, defaults);
 
-  /// GORM's association mode for one row.
+  /// GORM's association mode for relation [name] of one [row].
+  ///
+  /// [row] is the row as a map, or just its primary key. Throws an
+  /// [ArgumentError] if the model has no relation [name], or the row has no
+  /// primary key.
+  ///
+  /// ```dart
+  /// await posts.association(post, 'tags').append([tagId]);
+  /// ```
   PlexivoAssociation association(Object row, String name) => PlexivoAssociation(_layer, this, row, name);
 }
 
 const Object _gap = Object();
 
-/// What a table context needs from the client: run operations, find models.
+/// What a query needs from the client: run operations and find models.
+///
+/// [PlexivoClient] implements it, and so does the `tx` of a transaction.
 abstract class DataLayer {
+  /// Starts a query on [table].
   PlexivoQuery from(String table);
+
+  /// The model registered for [table], or null.
   PlexivoModel? modelOf(String table);
+
+  /// Whether operations are recorded for a transaction instead of sent at once.
+  ///
+  /// True only on a transaction's `tx`.
   bool get deferred;
+
+  /// Sends one structured operation [op] to the Data API and returns the response.
   Future<Map<String, dynamic>> query(Map<String, dynamic> op);
+
+  /// Runs an operation, or records it in a transaction.
+  ///
+  /// [build] makes the operation and [finish] turns the response into the
+  /// result. [shape] says how a later `ref()` reads the result: `rows` for a
+  /// list of rows.
   Future<T> send<T>(FutureOr<Map<String, dynamic>> Function() build, FutureOr<T> Function(Map<String, dynamic>) finish, String shape);
+
+  /// Runs the operations [callback] records in one transaction.
+  ///
+  /// See [PlexivoClient.transaction].
   Future<List<dynamic>> transaction(FutureOr<void> Function(DataLayer tx) callback);
 }
 
-/// The per-table context a query compiles and runs against.
+/// The table context a query compiles and runs against, with its model applied.
+///
+/// The SDK creates these; apps don't need to.
 class ModelContext implements TableContext {
+  /// Creates the context for [table] on a data layer, with an optional model.
   ModelContext(this._layer, this.table, [this._model]);
 
   final DataLayer _layer;
@@ -384,8 +602,27 @@ Object? _strip(Object? value) {
 Map<String, dynamic> _clean(Map<String, dynamic> m) =>
     Map.fromEntries(m.entries.where((e) => e.value != null && !(e.value is List && (e.value as List).isEmpty)));
 
-/// GORM's association mode: find, append, replace, delete (the link), clear, count.
+/// GORM's association mode: find, append, replace, delete, clear and count one row's related rows.
+///
+/// Get one from [PlexivoModel.association]. Related rows can be given as row
+/// maps or as their primary keys.
+///
+/// ```dart
+/// final posts = db.model('posts', relations: {
+///   'tags': const PlexivoRelation.manyToMany('tags',
+///       through: 'post_tags', foreignKey: 'post_id', otherKey: 'tag_id'),
+/// });
+/// final tags = posts.association(7, 'tags');
+/// await tags.append([3, 4]);       // link tags 3 and 4
+/// await tags.replace([4, 5]);      // now exactly 4 and 5
+/// print(await tags.count());       // 2
+/// await tags.clear();              // unlink all; the tags stay
+/// ```
 class PlexivoAssociation {
+  /// Opens association mode for [name] on [row].
+  ///
+  /// Prefer [PlexivoModel.association]. Throws an [ArgumentError] if the model
+  /// has no relation [name], or the row has no primary key.
   PlexivoAssociation(this._layer, this._model, Object row, String name)
       : _rel = _model.relations[name] ?? (throw ArgumentError('${_model.table} has no relation $name')),
         _row = row is Map ? Map<String, dynamic>.from(row) : {_model.primaryKey: row} {
@@ -401,6 +638,10 @@ class PlexivoAssociation {
   String get _targetPk => _rel.references ?? _layer.modelOf(_rel.table)?.primaryKey ?? 'id';
   Object? _key(Object v) => v is Map ? v[_targetPk] : v;
 
+  /// The related rows.
+  ///
+  /// For belongs-to, a list of zero or one row. [callback] narrows the other
+  /// kinds, such as `(q) => q.where('approved', true)`.
   Future<List<Map<String, dynamic>>> find([PlexivoQuery Function(PlexivoQuery)? callback]) async {
     switch (_rel.kind) {
       case 'belongsTo':
@@ -420,6 +661,13 @@ class PlexivoAssociation {
 
   Object get _owner => _rel.references != null ? _row[_rel.references] : _id;
 
+  /// Links [related] rows to this row.
+  ///
+  /// - Belongs-to: points this row at the first of [related].
+  /// - Many-to-many: adds link rows, skipping links that already exist.
+  /// - Has-one and has-many: in one transaction, sets the foreign key on rows
+  ///   given by key (or as maps with a key), and inserts maps without a key as
+  ///   new related rows.
   Future<void> append(List<Object> related) async {
     switch (_rel.kind) {
       case 'belongsTo':
@@ -444,6 +692,11 @@ class PlexivoAssociation {
         for (final r in list) {_rel.foreignKey!: _id, _rel.otherKey!: _key(r)}
       ];
 
+  /// Makes [related] the only rows linked to this row.
+  ///
+  /// Many-to-many and has-many changes run in one transaction. Rows no longer
+  /// linked keep existing: link rows are deleted, or foreign keys set to null.
+  /// For belongs-to, an empty list sets this row's foreign key to null.
   Future<void> replace(List<Object> related) async {
     switch (_rel.kind) {
       case 'belongsTo':
@@ -469,6 +722,10 @@ class PlexivoAssociation {
     }
   }
 
+  /// Unlinks [related] rows from this row; the rows themselves stay.
+  ///
+  /// Many-to-many deletes the link rows. Has-one and has-many set the related
+  /// rows' foreign key to null. Belongs-to sets this row's foreign key to null.
   Future<void> delete(List<Object> related) async {
     final keys = related.map(_key).toList();
     switch (_rel.kind) {
@@ -483,6 +740,7 @@ class PlexivoAssociation {
     }
   }
 
+  /// Unlinks every related row; the rows themselves stay.
   Future<void> clear() async {
     switch (_rel.kind) {
       case 'belongsTo':
@@ -496,6 +754,9 @@ class PlexivoAssociation {
     }
   }
 
+  /// The number of related rows.
+  ///
+  /// For belongs-to, 1 when the foreign key is set, otherwise 0.
   Future<int> count() {
     switch (_rel.kind) {
       case 'belongsTo':
