@@ -96,8 +96,7 @@ Everything Plexivo Postgres offers, from Flutter and Dart.
 Breaking: `from(table)` returns the query builder (awaiting `select()` still
 gives the rows, as a `PlexivoResult` list with `count`); `get/update/delete`
 by id are `first(id)`, `updateById`, `deleteById`; channel changes are
-`PlexivoChange` objects. Needs a Plexivo Brain with the structured Data API
-(R6.36).
+`PlexivoChange` objects. Needs a Plexivo Postgres with the structured Data API.
 
 ## 0.1.0
 
