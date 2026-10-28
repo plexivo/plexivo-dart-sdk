@@ -1,6 +1,6 @@
 .dart_tool/
 .packages
-pubspec.lock
+# Keep the development/test dependency lock for reproducible CI.
 build/
 coverage/
 .env
